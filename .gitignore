@@ -37,3 +37,6 @@ __pycache__
 
 # python
 dist/
+
+# run_policy.py logs
+go2/logs/

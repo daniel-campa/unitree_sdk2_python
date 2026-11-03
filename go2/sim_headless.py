@@ -28,6 +28,7 @@ parser.add_argument("--domain", type=int, default=1, help="DDS domain id")
 parser.add_argument("--duration", type=float, default=0.0, help="seconds to run; 0 = forever")
 parser.add_argument("--dt", type=float, default=0.005, help="physics timestep, seconds")
 parser.add_argument("--video", type=Path, help="record the run to this .mp4 (needs --duration or Ctrl-C to finish)")
+parser.add_argument("--flat", action="store_true", help="remove the scene's boxes, leaving only the floor")
 args = parser.parse_args()
 
 sim_dir = args.unitree_mujoco / "simulate_python"
@@ -42,6 +43,12 @@ from unitree_sdk2py_bridge import UnitreeSdk2Bridge  # noqa: E402
 
 model = mujoco.MjModel.from_xml_path(str(scene))
 model.opt.timestep = args.dt  # set first: the bridge reads it for its publish rate
+if args.flat:
+    floor = model.geom("floor").id
+    for geom in range(model.ngeom):
+        if model.geom_bodyid[geom] == 0 and geom != floor:  # body 0 is the world
+            model.geom_contype[geom] = model.geom_conaffinity[geom] = 0
+            model.geom_rgba[geom, 3] = 0.0
 data = mujoco.MjData(model)
 mujoco.mj_resetDataKeyframe(model, data, model.key("home").id)
 data.ctrl[:] = 0.0  # the keyframe's ctrl holds joint angles, but these are torque motors
@@ -80,7 +87,11 @@ def report():
     while not stop.wait(1.0):
         w, x, y, z = data.qpos[3:7]
         tilt = 1.0 - 2.0 * (x * x + y * y)  # body-up z component; 1 = level
-        print(f"t={data.time:7.2f}  base_z={data.qpos[2]:.3f} m  up_z={tilt:+.3f}", flush=True)
+        print(
+            f"t={data.time:7.2f}  base_x={data.qpos[0]:+.3f} m  base_y={data.qpos[1]:+.3f} m  "
+            f"base_z={data.qpos[2]:.3f} m  up_z={tilt:+.3f}",
+            flush=True,
+        )
 
 
 threading.Thread(target=report, daemon=True).start()
