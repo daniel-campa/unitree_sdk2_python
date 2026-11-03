@@ -82,7 +82,7 @@ MAX_WALK_S = 60.0
 # 11 rad/s (thigh) and 8 rad/s (calf).
 MAX_TILT = 0.5  # rad
 MAX_SPEED = np.array([25.0, 25.0, 14.0] * 4)  # rad/s, below Unitree's 30.1 and 15.7
-MAX_TEMPERATURE = 70  # °C
+MAX_TEMPERATURE = 75  # °C
 JOINT_LIMIT_MARGIN = 0.05  # rad
 MAX_STATE_AGE = 0.1  # s
 # The policy holds each target for 200 ms anyway, so a shorter stall is harmless.
@@ -92,7 +92,7 @@ MAX_LOOP_STALL = 0.2  # s
 MAX_STAND_ERROR = 0.2  # rad; kp = 80 sags the rear hips by about 0.12 rad
 MAX_STAND_TILT = 0.2  # rad
 MAX_STAND_SPEED = 0.5  # rad/s
-MIN_BATTERY_PERCENT = 30
+MIN_BATTERY_PERCENT = 15
 
 STOP_BUTTON_MASK = 1 << 1  # B, in wireless_remote[3]; see example/wireless_controller
 POS_STOP, VEL_STOP = 2.146e9, 16000.0  # values that disable a motor's control loops

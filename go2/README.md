@@ -81,6 +81,8 @@ python go2/check_connection.py "$IFACE" | tee connection_check.txt
 |---|---|
 | `no network interface called ...` | Use a name from the list it prints. |
 | `... is down` | Check the cable and that the robot is on, then repeat step 3. |
+| `has no IPv4 address` | Repeat step 3. |
+| `channel factory init error` | CycloneDDS couldn't start, and the line above the error may say why. It writes a log to `/tmp/cdds-<uid>.LOG`, so if that can't be opened, delete the file. |
 | `has no 192.168.123.x address` | Repeat step 3. If the address keeps disappearing, the network manager is probably removing it, so see below. |
 | `no rt/lowstate received` | Check the robot's power and the cable, then run `ip addr show "$IFACE"` to confirm the address. A firewall can also block this, so check `sudo ufw status`. |
 | `conda: command not found` | Install Miniconda, or run `source ~/miniconda3/etc/profile.d/conda.sh` if it's already installed. |
@@ -135,6 +137,20 @@ python go2/check_lidar.py "$IFACE" | tee lidar_check.txt
 | `frame ... isn't handled` | The script can't place that topic's points relative to the body. This doesn't matter if another source passes. Otherwise, the frame needs adding to the script. |
 | `needs the robot's pose` | That topic's data needs `rt/utlidar/robot_odom`, which isn't arriving. |
 | `no source covered all seven beams` | Check `valid %`. A low value on every beam suggests sparse data, and a value near 0 on some beams suggests the lidar can't see them. `--ahead` tries the beams at another distance, to find where coverage starts. |
+
+### Try it in the simulator
+
+To see what the report looks like without a robot, `sim_headless.py --lidar` publishes simulated lidar topics. `--box` adds the box from run 2 above. Run each command in its own terminal:
+
+```bash
+python go2/sim_headless.py --lidar --box
+python go2/stand_test.py --hold 15
+python go2/check_lidar.py lo --domain 1 --seconds 5
+```
+
+Start the check about 3 s after `stand_test.py`, once the robot is standing. Without `stand_test.py` the robot lies on the floor, so the heights are smaller, but the differences stay the same.
+
+**A PASS here says nothing about the real robot.** The simulated data has no noise, and its frames, scan pattern and lidar mount are assumptions. `rt/sportmodestate` always publishes in the simulator, so ignore the sport mode line too. The simulated lidar also slows the simulator by about 7%, so leave it off when testing policies.
 
 ## Run a policy
 

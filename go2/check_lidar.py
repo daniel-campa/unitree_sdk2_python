@@ -312,7 +312,7 @@ def main():
             print(f"WARNING: lidar reports error_state {latest_state.error_state}.")
 
     print(f"\nBeams {args.ahead:g} m ahead of the base, left to right. Heights are relative to the base, in m.")
-    print("In simulation, a beam reads about -0.27 on the platform and -0.57 past its edge.")
+    print("In S-M-ICRL's simulation, a beam reads about -0.27 on the platform and -0.57 past its edge.")
     print("The policies steer on the differences, which should be about 0 on a flat floor.")
 
     coverage = {topic: report_source(topic, source, describe_cloud) for topic, source in clouds.items()}

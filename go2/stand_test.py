@@ -58,6 +58,7 @@ class Latest:
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--domain", type=int, default=1, help="DDS domain id")
+parser.add_argument("--hold", type=float, default=HOLD_S, help="seconds to stay standing (default: %(default)s)")
 args = parser.parse_args()
 
 ChannelFactoryInitialize(args.domain, "lo")
@@ -121,7 +122,7 @@ start_q, start_z = joints(), height()
 print(f"start:      imu_z={start_z:.3f} m", flush=True)
 
 run_phase(start_q, STAND, RAMP_S)
-run_phase(STAND, STAND, HOLD_S)
+run_phase(STAND, STAND, args.hold)
 stand_error, stand_z, stand_up, stand_speed = (
     float(np.abs(joints() - STAND).max()), height(), up_z(), joint_speed()
 )

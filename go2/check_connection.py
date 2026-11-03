@@ -60,6 +60,10 @@ def check_interface(name):
     output = subprocess.run(
         ["ip", "-o", "-4", "addr", "show", name], capture_output=True, text=True, check=False
     ).stdout
+    if not output.strip():  # CycloneDDS can't select an interface without an IPv4 address
+        print(f"ERROR: {name} has no IPv4 address. Give it one with:")
+        print(f"  sudo ip addr add {ROBOT_SUBNET}51/24 dev {name}")
+        return False
     if ROBOT_SUBNET not in output:
         print(f"WARNING: {name} has no {ROBOT_SUBNET}x address, so the robot's state may not arrive.")
     return True

@@ -29,6 +29,9 @@ parser.add_argument("--duration", type=float, default=0.0, help="seconds to run;
 parser.add_argument("--dt", type=float, default=0.005, help="physics timestep, seconds")
 parser.add_argument("--video", type=Path, help="record the run to this .mp4 (needs --duration or Ctrl-C to finish)")
 parser.add_argument("--flat", action="store_true", help="remove the scene's boxes, leaving only the floor")
+parser.add_argument("--lidar", action="store_true", help="publish simulated lidar topics, for check_lidar.py")
+parser.add_argument("--box", action="store_true",
+                    help="add a 10 cm box ahead and to the left of the robot, like the README's lidar test")
 args = parser.parse_args()
 
 sim_dir = args.unitree_mujoco / "simulate_python"
@@ -41,12 +44,19 @@ import mujoco  # noqa: E402
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize  # noqa: E402
 from unitree_sdk2py_bridge import UnitreeSdk2Bridge  # noqa: E402
 
-model = mujoco.MjModel.from_xml_path(str(scene))
+BOX_NAME = "lidar_test_box"
+if args.box:
+    spec = mujoco.MjSpec.from_file(str(scene))
+    spec.worldbody.add_geom(name=BOX_NAME, type=mujoco.mjtGeom.mjGEOM_BOX, pos=[0.45, 0.25, 0.05],
+                            size=[0.10, 0.20, 0.05], rgba=[0.8, 0.4, 0.2, 1.0])
+    model = spec.compile()
+else:
+    model = mujoco.MjModel.from_xml_path(str(scene))
 model.opt.timestep = args.dt  # set first: the bridge reads it for its publish rate
 if args.flat:
-    floor = model.geom("floor").id
+    keep = {model.geom("floor").id, mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, BOX_NAME)}
     for geom in range(model.ngeom):
-        if model.geom_bodyid[geom] == 0 and geom != floor:  # body 0 is the world
+        if model.geom_bodyid[geom] == 0 and geom not in keep:  # body 0 is the world
             model.geom_contype[geom] = model.geom_conaffinity[geom] = 0
             model.geom_rgba[geom, 3] = 0.0
 data = mujoco.MjData(model)
@@ -55,6 +65,11 @@ data.ctrl[:] = 0.0  # the keyframe's ctrl holds joint angles, but these are torq
 
 ChannelFactoryInitialize(args.domain, "lo")
 bridge = UnitreeSdk2Bridge(model, data)
+lidar = None
+if args.lidar:
+    from sim_lidar import SimLidar
+
+    lidar = SimLidar(model, data)
 print(f"sim up: domain={args.domain} interface=lo dt={args.dt}", flush=True)
 
 VIDEO_FPS = 30
@@ -101,6 +116,8 @@ try:
     while not args.duration or time.perf_counter() - start < args.duration:
         step_start = time.perf_counter()
         mujoco.mj_step(model, data)
+        if lidar is not None:
+            lidar.step()
         if writer is not None and data.time * VIDEO_FPS >= frames_written:
             record_frame()
         remaining = model.opt.timestep - (time.perf_counter() - step_start)
