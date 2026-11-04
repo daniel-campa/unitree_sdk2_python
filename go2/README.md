@@ -2,7 +2,7 @@
 
 Follow these steps on the Ubuntu computer wired to the robot. They end with a read-only check that sends no commands to the robot.
 
-**Don't run other scripts yet.** Unitree's examples can move the robot as soon as you give them a network interface. `stand_test.py` only works with the simulator, so it can't reach the robot. `run_policy.py` only reaches the robot if you pass `--robot`, and [Run a policy](#run-a-policy) covers when to do that. `check_lidar.py` is also read-only, and [Check the lidar](#check-the-lidar) covers it.
+**Don't run other scripts yet.** Unitree's examples can move the robot as soon as you give them a network interface. `stand_test.py` only works with the simulator, so it can't reach the robot. `run_policy.py` only reaches the robot if you pass `--robot`, and [Run a policy](#run-a-policy) covers when to do that. `check_lidar.py` and `lidar_map.py` are also read-only, and [Check the lidar](#check-the-lidar) covers them.
 
 ## 1. Install
 
@@ -137,6 +137,19 @@ python go2/check_lidar.py "$IFACE" | tee lidar_check.txt
 | `frame ... isn't handled` | The script can't place that topic's points relative to the body. This doesn't matter if another source passes. Otherwise, the frame needs adding to the script. |
 | `needs the robot's pose` | That topic's data needs `rt/utlidar/robot_odom`, which isn't arriving. |
 | `no source covered all seven beams` | Check `valid %`. A low value on every beam suggests sparse data, and a value near 0 on some beams suggests the lidar can't see them. `--ahead` tries the beams at another distance, to find where coverage starts. |
+
+### See the height map
+
+`lidar_map.py` draws the height map live, with the robot and the seven beams on top. It's also read-only. Close the window to stop it, or use `--save` to get one picture without needing a display:
+
+```bash
+python go2/lidar_map.py "$IFACE"
+python go2/lidar_map.py "$IFACE" --save lidar_map.png
+```
+
+- **Colours:** these show height relative to the base, on a fixed scale from -0.7 to +0.1 m. Grey cells are unknown, and anything above +0.1 m shows as the top colour.
+- **Robot:** the red dot is the base, and the arrow points to the middle beam. Beam `0` should be on the robot's left.
+- **Terminal:** it prints the most repeated values in the first map. A value repeated across many cells is probably the marker for unknown cells. If that marker is smaller than 100 m, the script draws it as a real height.
 
 ### Try it in the simulator
 

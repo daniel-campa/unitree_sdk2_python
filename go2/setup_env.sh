@@ -26,6 +26,7 @@ ENV_PY="$(conda run -n "$ENV_NAME" python -c 'import sys; print(sys.executable)'
 export PYTHONNOUSERSITE=1  # stop ~/.local packages shadowing the env
 
 "$ENV_PY" -m pip install -e "$REPO_DIR"
+"$ENV_PY" -m pip install matplotlib==3.10.9  # for go2/lidar_map.py
 
 if [ "$WITH_SIM" = 1 ]; then
   if [ ! -d "$SIM_DIR/.git" ]; then
