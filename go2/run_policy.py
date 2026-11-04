@@ -5,8 +5,9 @@ This uses the simulator unless you pass --robot. With --robot it MOVES THE ROBOT
 so follow the test order in go2/README.md.
 
     python go2/run_policy.py POLICY.py                         # simulator
-    python go2/run_policy.py POLICY.py --robot enp3s0 --dry-run  # robot, read-only
-    python go2/run_policy.py POLICY.py --robot enp3s0            # robot
+    python go2/run_policy.py POLICY.py --robot --dry-run        # robot, read-only
+    python go2/run_policy.py POLICY.py --robot                  # robot
+    python go2/run_policy.py POLICY.py --robot enp3s0           # robot, on another interface
 
 The sequence is: stand up, hold, walk for --seconds, return to the home pose, lie
 down, then damp the motors. A fault, the remote's B button or Ctrl-C goes straight
@@ -34,7 +35,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 import numpy as np
-from check_connection import JOINTS, check_interface, state_problems
+from check_connection import DEFAULT_INTERFACE, JOINTS, check_interface, state_problems
 from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient
 from unitree_sdk2py.core.channel import (
     ChannelFactoryInitialize,
@@ -618,8 +619,9 @@ def bounded(low, high):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("policy", type=Path, help="policy file from S-M-ICRL")
-    parser.add_argument("--robot", metavar="INTERFACE",
-                        help="network interface wired to the robot; without this, use the simulator")
+    parser.add_argument("--robot", metavar="INTERFACE", nargs="?", const=DEFAULT_INTERFACE,
+                        help="use the robot, on this network interface (if none is given: %(const)s); "
+                             "without --robot, use the simulator")
     parser.add_argument("--dry-run", action="store_true", help="print commands without publishing them")
     parser.add_argument("--seconds", type=bounded(0.0, MAX_WALK_S), default=3.0,
                         help="how long to walk; 0 only stands up and lies down (default: %(default)s)")

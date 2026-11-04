@@ -4,7 +4,8 @@
 This script only subscribes to state topics. It creates no publishers and no
 SDK clients, so it cannot command the robot.
 
-    python go2/check_connection.py <interface>            # real robot, e.g. enp3s0
+    python go2/check_connection.py                        # real robot, on DEFAULT_INTERFACE
+    python go2/check_connection.py <interface>            # real robot, on another interface
     python go2/check_connection.py lo --domain 1          # go2/sim_headless.py
 
 Exit status: 0 = healthy state received, 1 = no state or invalid state,
@@ -23,6 +24,7 @@ from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowState_, SportModeState_
 
 JOINTS = [f"{leg}_{part}" for leg in ("FR", "FL", "RR", "RL") for part in ("hip", "thigh", "calf")]
 ROBOT_SUBNET = "192.168.123."
+DEFAULT_INTERFACE = "enx80691a8d7c72"
 
 
 class TopicMonitor:
@@ -96,7 +98,8 @@ def print_state(msg):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("interface", help="network interface wired to the robot")
+    parser.add_argument("interface", nargs="?", default=DEFAULT_INTERFACE,
+                        help="network interface wired to the robot (default: %(default)s)")
     parser.add_argument("--domain", type=int, default=0, help="DDS domain id (the robot uses 0)")
     parser.add_argument("--seconds", type=float, default=5.0, help="how long to listen")
     args = parser.parse_args()

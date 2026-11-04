@@ -39,10 +39,10 @@ Find the Ethernet port's name, which usually starts with `en`:
 ip -br link
 ```
 
-Set it here, replacing the example name, then give the port an address on the robot's network:
+The scripts default to `enx80691a8d7c72`. If yours is different, use its name below and pass it to each script. Set it here, then give the port an address on the robot's network:
 
 ```bash
-IFACE=enp3s0
+IFACE=enx80691a8d7c72
 sudo ip addr add 192.168.123.51/24 dev "$IFACE"
 sudo ip link set "$IFACE" up
 ```

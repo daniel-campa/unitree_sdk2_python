@@ -4,8 +4,10 @@
 This script only subscribes to topics. It creates no publishers and no SDK
 clients, so it can't command the robot or switch the lidar on or off.
 
-    python go2/lidar_map.py <interface>                   # live window; close it to stop
-    python go2/lidar_map.py <interface> --save map.png    # one picture, with no display needed
+    python go2/lidar_map.py [interface]                   # live window; close it to stop
+    python go2/lidar_map.py [interface] --save map.png    # one picture, with no display needed
+
+The interface defaults to DEFAULT_INTERFACE in check_connection.py.
 
 The left panel is the whole map and the right panel is the area around the robot.
 Heights are relative to the base, like the beam heights from check_lidar.py, and
@@ -21,7 +23,7 @@ import time
 import matplotlib
 import numpy as np
 
-from check_connection import TopicMonitor, check_interface
+from check_connection import DEFAULT_INTERFACE, TopicMonitor, check_interface
 from check_lidar import (
     BEAM_AHEAD,
     BEAM_PAIRS,
@@ -159,7 +161,8 @@ def show_live(figure, panels, cmap, view, height_map, odom, plt):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("interface", help="network interface wired to the robot")
+    parser.add_argument("interface", nargs="?", default=DEFAULT_INTERFACE,
+                        help="network interface wired to the robot (default: %(default)s)")
     parser.add_argument("--domain", type=int, default=0, help="DDS domain id (the robot uses 0)")
     parser.add_argument("--seconds", type=float, default=10.0, help="how long to wait for the first map")
     parser.add_argument("--save", metavar="FILE", help="save one picture to FILE and exit, instead of opening a window")

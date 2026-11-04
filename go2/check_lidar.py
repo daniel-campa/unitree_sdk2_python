@@ -4,8 +4,8 @@
 This script only subscribes to topics. It creates no publishers and no SDK
 clients, so it can't command the robot or switch the lidar on or off.
 
-    python go2/check_lidar.py <interface>              # e.g. enp3s0
-    python go2/check_lidar.py <interface> --seconds 30
+    python go2/check_lidar.py [interface]              # default: DEFAULT_INTERFACE in check_connection.py
+    python go2/check_lidar.py [interface] --seconds 30
 
 It reports the rate of each lidar topic, then reads the seven downward beams
 used by the platform_curve policies from every source it can. Keep the robot
@@ -22,7 +22,7 @@ from collections import Counter
 
 import numpy as np
 
-from check_connection import TopicMonitor, check_interface
+from check_connection import DEFAULT_INTERFACE, TopicMonitor, check_interface
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
 from unitree_sdk2py.idl.nav_msgs.msg.dds_ import Odometry_
 from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
@@ -261,7 +261,8 @@ def report_source(topic, source, describe):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("interface", help="network interface wired to the robot")
+    parser.add_argument("interface", nargs="?", default=DEFAULT_INTERFACE,
+                        help="network interface wired to the robot (default: %(default)s)")
     parser.add_argument("--domain", type=int, default=0, help="DDS domain id (the robot uses 0)")
     parser.add_argument("--seconds", type=float, default=10.0, help="how long to listen")
     parser.add_argument("--ahead", type=float, default=BEAM_AHEAD,
