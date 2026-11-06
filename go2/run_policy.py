@@ -8,10 +8,14 @@ so follow the test order in go2/README.md.
     python go2/run_policy.py POLICY.py --robot --dry-run        # robot, read-only
     python go2/run_policy.py POLICY.py --robot                  # robot
     python go2/run_policy.py POLICY.py --robot enp3s0           # robot, on another interface
+    python go2/run_policy.py POLICY.py --check                  # only check the policy
 
 The sequence is: stand up, hold, walk for --seconds, return to the home pose, lie
 down, then damp the motors. A fault, the remote's B button or Ctrl-C goes straight
 to damping. Start the simulator with `python go2/sim_headless.py --flat --dt 0.002`.
+
+The log also keeps rt/utlidar/robot_odom, the robot's position estimate, when it
+publishes. Nothing here acts on it; S-M-ICRL scores walking with it.
 
 POLICY.py is S-M-ICRL code that defines policy(robot_state) and ends with
 robot.simulate_rollout(policy). The defaults for --policy-hz, --kp and --kd come
@@ -28,6 +32,7 @@ import select
 import signal
 import sys
 import termios
+import threading
 import time
 import traceback
 from datetime import datetime
@@ -44,6 +49,7 @@ from unitree_sdk2py.core.channel import (
 )
 from unitree_sdk2py.go2.sport.sport_client import SportClient
 from unitree_sdk2py.idl.default import unitree_go_msg_dds__LowCmd_
+from unitree_sdk2py.idl.nav_msgs.msg.dds_ import Odometry_
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowCmd_, LowState_
 from unitree_sdk2py.utils.crc import CRC
 
@@ -102,6 +108,7 @@ RELEASE_ATTEMPTS = 5
 
 LOG_FIELDS = ("t", "stage", "q", "dq", "target", "q_cmd", "tau_est", "temperature", "rpy",
               "gyro", "accel", "foot_force", "power_v", "power_a")
+ODOM_TOPIC = "rt/utlidar/robot_odom"
 
 # The same limits S-M-ICRL applies when it runs generated policy code.
 POLICY_IMPORTS = ("numpy", "math", "random", "itertools", "functools", "collections", "copy")
@@ -273,21 +280,25 @@ def load_policy(path):
     return catcher.policy
 
 
-def check_policy(policy, env):
-    """Refuse a policy that fails, or that depends on state the robot can't provide."""
+def check_policy(path, env):
+    """Refuse a policy that fails, or that depends on state the robot can't provide.
+
+    Each probe gets a fresh copy of the policy, so a policy that keeps its own state
+    between calls is compared on its first call only.
+    """
     for thigh in (0.7, 0.9, 1.1):
         q = HOME.copy()
         q[1::3] = thigh
         robot_state = np.concatenate([q, np.zeros(18), [np.nan] * 4, [0.0, 0.0, 1.0]])
-        reference = policy_target(policy, robot_state, env)
+        reference = policy_target(load_policy(path), robot_state, env)
         for height, speed in ((0.1, -1.0), (0.4, 1.0)):
             probe = robot_state.copy()
             probe[30:33], probe[33] = speed, height
-            if not np.array_equal(policy_target(policy, probe, env), reference):
+            if not np.array_equal(policy_target(load_policy(path), probe, env), reference):
                 raise Fault(
                     "its output changes with body height or linear velocity (robot_state[30:34]), "
-                    "or between identical calls. The robot can't provide those values, and "
-                    "this script doesn't support a policy that keeps its own state."
+                    "which the robot can't provide, or it isn't repeatable, for example because "
+                    "it uses random numbers"
                 )
 
 
@@ -295,7 +306,7 @@ def prepare_policy(path, env):
     """Return a checked policy and the file's hash. A stalling policy trips the watchdog."""
     arm_watchdog(5.0)
     try:
-        check_policy(load_policy(path), env)
+        check_policy(path, env)
         policy = load_policy(path)  # a fresh copy, unaffected by the checks above
     except Exception as error:
         raise Refused(f"can't use policy {path}: {error}") from error
@@ -505,12 +516,12 @@ class Controller:
             next_tick += DT
             time.sleep(max(0.0, next_tick - time.perf_counter()))
 
-    def save_log(self, path, meta):
+    def save_log(self, path, meta, odom):
         if not self.records:
             return None
         path.parent.mkdir(parents=True, exist_ok=True)
         columns = {name: np.array(column) for name, column in zip(LOG_FIELDS, zip(*self.records))}
-        np.savez_compressed(path, meta=json.dumps(meta), **columns)
+        np.savez_compressed(path, meta=json.dumps(meta), **columns, **odom.columns(self.clock_start))
         return path
 
     def print_summary(self):
@@ -523,6 +534,28 @@ class Controller:
                   f"thigh {tau[:, 1::3].max():.1f}, calf {tau[:, 2::3].max():.1f} N·m")
         print(f"Timing: worst loop overrun {self.worst_overrun * 1000:.1f} ms, "
               f"oldest state {self.worst_state_age * 1000:.1f} ms")
+
+
+class OdomRecorder:
+    """Keep every rt/utlidar/robot_odom message for the log. Nothing acts on them."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._rows = []
+        self._subscriber = ChannelSubscriber(ODOM_TOPIC, Odometry_)
+        self._subscriber.Init(self, 10)
+
+    def __call__(self, msg):
+        p, q = msg.pose.pose.position, msg.pose.pose.orientation
+        row = (time.perf_counter(), p.x, p.y, p.z, q.w, q.x, q.y, q.z)
+        with self._lock:
+            self._rows.append(row)
+
+    def columns(self, clock_start):
+        """odom_t on the log's clock, and odom_pose as x, y, z, qw, qx, qy, qz."""
+        with self._lock:
+            rows = np.array(self._rows) if self._rows else np.empty((0, 8))
+        return {"odom_t": rows[:, 0] - clock_start, "odom_pose": rows[:, 1:]}
 
 
 def connect(args):
@@ -544,7 +577,7 @@ def connect(args):
     problems = state_problems(monitor.msg)
     if problems:
         raise Refused("invalid robot state: " + "; ".join(problems))
-    return monitor, subscriber
+    return monitor, subscriber, OdomRecorder()
 
 
 def confirm_stop_button(monitor):
@@ -623,6 +656,8 @@ def parse_args():
                         help="use the robot, on this network interface (if none is given: %(const)s); "
                              "without --robot, use the simulator")
     parser.add_argument("--dry-run", action="store_true", help="print commands without publishing them")
+    parser.add_argument("--check", action="store_true",
+                        help="only load and check the policy, without connecting to anything")
     parser.add_argument("--seconds", type=bounded(0.0, MAX_WALK_S), default=3.0,
                         help="how long to walk; 0 only stands up and lies down (default: %(default)s)")
     parser.add_argument("--policy-hz", type=bounded(0.5, 500.0), default=POLICY_HZ,
@@ -647,7 +682,10 @@ def main():
     original_mode = None
     try:
         policy, digest = prepare_policy(args.policy, env)
-        monitor, subscriber = connect(args)
+        if args.check:
+            print(f"Policy OK: {args.policy}", flush=True)
+            return 0
+        monitor, subscriber, odom = connect(args)
         if args.dry_run:
             dry_run(monitor, policy, env, args.policy_hz, args.seconds)
             return 0
@@ -691,7 +729,10 @@ def main():
         "policy_hz": args.policy_hz, "kp": args.kp, "kd": args.kd, "seconds": args.seconds,
         "torque_fraction": args.torque_fraction, "probe_height": args.probe_height,
         "original_mode": original_mode,
-    })
+        # "t" counts from this time.perf_counter() reading, so other programs' times,
+        # such as go2/phone_camera.py's, can be matched to the log.
+        "clock_start": controller.clock_start,
+    }, odom)
     print(f"\nResult: {outcome}")
     controller.print_summary()
     if saved:

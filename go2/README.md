@@ -2,7 +2,7 @@
 
 Follow these steps on the Ubuntu computer wired to the robot. They end with a read-only check that sends no commands to the robot.
 
-**Don't run other scripts yet.** Unitree's examples can move the robot as soon as you give them a network interface. `stand_test.py` only works with the simulator, so it can't reach the robot. `run_policy.py` only reaches the robot if you pass `--robot`, and [Run a policy](#run-a-policy) covers when to do that. `check_lidar.py` and `lidar_map.py` are also read-only, and [Check the lidar](#check-the-lidar) covers them.
+**Don't run other scripts yet.** Unitree's examples can move the robot as soon as you give them a network interface. `stand_test.py` only works with the simulator, so it can't reach the robot. `run_policy.py` only reaches the robot if you pass `--robot`, and [Run a policy](#run-a-policy) covers when to do that. `check_lidar.py` and `lidar_map.py` are also read-only, and [Check the lidar](#check-the-lidar) covers them. So is `check_odom.py`, which [Check the odometry](#check-the-odometry) covers. `phone_camera.py` never talks to the robot, and [Film with a phone](#film-with-a-phone) covers it.
 
 ## 1. Install
 
@@ -173,6 +173,8 @@ Start the check about 3 s after `stand_test.py`, once the robot is standing. Wit
 
 The script feeds the policy fixed flat-floor values instead of real terrain probes, so **the robot can't sense steps or obstacles**.
 
+It refuses a policy whose output depends on body height or linear velocity (`robot_state[30:34]`), because the robot can't measure them. A policy may keep state between calls. `--check` only loads and checks the policy, without connecting to anything. S-M-ICRL's real-robot loop uses it before each run.
+
 ### Test in the simulator
 
 Install the simulator with `go2/setup_env.sh --with-sim`, then:
@@ -250,4 +252,117 @@ These go straight to damping, which lets the robot sink to the ground:
 
 The script aims to keep torque within 60% of the limits (`--torque-fraction`). Peaks can go above that: the thigh reached about 21 N·m in simulation, against a 14 N·m target and a 23.7 N·m limit.
 
-Each run saves its data to `go2/logs/<time>.npz`. Sport mode stays off after a run, so restart the robot to get it back.
+Each run saves its data to `go2/logs/<time>.npz`, including `rt/utlidar/robot_odom` when it publishes. Sport mode stays off after a run, so restart the robot to get it back.
+
+## Check the odometry
+
+`check_odom.py` tests whether the robot's own position estimate is good enough to score S-M-ICRL's walk reward on the real robot. It only subscribes to topics. The robot moves only when you move it: with the remote, with `run_policy.py` in another terminal, or by hand.
+
+Do this once [Test on the robot](#test-on-the-robot) works. You need two terminals, the remote, floor tape, a tape measure, and the clear lane from stage 3. Then run:
+
+```bash
+python go2/check_odom.py record "$IFACE"
+```
+
+It takes you through five steps, waiting for Enter between them:
+
+| Step | What you do | What it shows |
+|---|---|---|
+| 1. Still, sport mode on | Leave the robot standing as it is after start-up, and stand back for 20 s | the noise with sport mode running |
+| 2. Remote walk (optional) | Walk it about 1 m forward with the remote | accuracy with sport mode's own estimator running |
+| 3. Policy walk | Run `run_policy.py --robot` in the other terminal | whether each topic survives sport mode being released and follows a low-level walk |
+| 4. Moved by hand (optional) | Slide or carry it about 1 m forward, holding the body | whether each topic follows the robot when no legs are stepping |
+| 5. Still, sport mode off | Stand back for 20 s | the noise after the release |
+
+- **Measuring:** before each move step, lay tape along the robot's heading and mark the floor under the middle of its body. Afterwards, type how far the middle of its body moved along the tape, and to the left of it (right is negative). Leave a blank for anything you didn't measure.
+- **Still steps:** the lidar sees people, so stand well back. `--still-seconds` changes their length.
+- **Stopping:** Ctrl-C in this terminal only stops the recording, not the robot. Each step is saved as it finishes.
+- **Timing:** recording runs alongside `run_policy.py` on the same computer. Check that its `worst loop overrun` stays like your earlier runs.
+
+When it finishes, it prints a report and saves the recording to `go2/logs/odom_<time>.npz`, with a plot next to it. To see the report again, run `python go2/check_odom.py analyze go2/logs/odom_<time>.npz`. `--free` skips the steps and records until Ctrl-C.
+
+### Reading the report
+
+It checks four topics. `rt/utlidar/robot_odom` and `rt/sportmodestate` published on the robot with sport mode on. `rt/utlidar/robot_pose` and `rt/odommodestate` are guesses, and `no messages` for them may only mean that their message type is different.
+
+1. **Publishing after sport mode was released.** `rt/sportmodestate` stops when sport mode is released, so that's taken as the release time. `STOPPED` means a topic can't be used under low-level control. A `jumped` line just after the release suggests that the estimate reset.
+2. **Following the robot.** This shows how far each topic says the robot moved in each move step, next to your measurements and the IMU's yaw. `DIDN'T MOVE` means the topic stayed put while the legs were moving.
+3. **Walk reward added by noise.** The walk reward adds up every small forward step in x and only part of every backward one, so noise alone earns reward. The table shows how much a still robot would earn in one 5 s episode, unfiltered and after moving averages of 0.1-0.5 s. Compare it with the 9 that walking 1 m earns. Besides the still steps, it uses stretches where the joints and gyro show the robot was still, such as the stand before the policy walks.
+4. **Height and yaw.** This compares each topic's z with the base height from leg kinematics, and its yaw with the IMU's. If the std is small, that z can stand in for the simulator's base height once the offset is removed.
+
+### Try the odometry check in the simulator
+
+Run each command in its own terminal, and stop the recording with Ctrl-C once the robot has lain down:
+
+```bash
+python go2/sim_headless.py --flat --dt 0.002 --lidar
+python go2/check_odom.py record lo --domain 1 --free
+python go2/run_policy.py go2/policies/walk_tmnxt_iter17.py --seconds 8
+```
+
+**This only shows that the script works.** The simulated `robot_odom` is the true position, with no noise, and `rt/sportmodestate` never stops in the simulator.
+
+## Film with a phone
+
+S-M-ICRL's real-robot loop can show the LLM pictures of each run, filmed by a phone. `phone_camera.py` reads the phone's video stream over the network. It never talks to the robot.
+
+**This hasn't been tried with a real phone.** It has only read a fake stream on this computer. The app names and addresses below are from the apps' own docs, so trust what the app shows over them.
+
+### 1. Stream from the phone
+
+Install an app that streams the camera over HTTP, and start its server:
+
+| Phone | App | Stream address |
+|---|---|---|
+| Android | IP Webcam | `http://<phone IP>:8080/video`. The app shows the IP at the bottom of the screen after **Start server**. |
+| Android or iPhone | DroidCam | `http://<phone IP>:4747/video` |
+
+Any app that gives an MJPEG or RTSP address should work, and the check below shows if yours does. In the app, choose landscape and about 1280x720 at 30 fps. Keep the phone charging, and stop its screen from locking, because many apps stop streaming when it locks. If the app can lock focus and exposure, lock them.
+
+### 2. Let this computer reach the phone
+
+They're usually both on the same Wi-Fi. Many campus and guest networks stop devices reaching each other, though. If the check below says `can't open`, try one of these:
+
+- **Phone hotspot:** connect this computer's Wi-Fi to the phone's hotspot, and use the address the app shows then. The LLM's traffic goes over the phone's data.
+- **Tailscale:** if this computer uses Tailscale, install it on the phone too, and use the phone's `100.x.y.z` address. This works across networks.
+- **SSH tunnel:** if another computer can open the stream (its browser shows it) and can SSH into this one, run `ssh -N -R 8080:<phone IP>:8080 <user>@<this computer>` on it, and leave it running. This computer then uses `http://localhost:8080/video`. The stream goes through the other computer, so it has to stay on.
+- **USB:** some Android phones (Android 14 or later) can be a USB webcam: plug it in and choose **Webcam** in the USB notification. Then use the camera's number instead of an address, for example `0` for `/dev/video0`. The cable has to reach the phone's spot.
+
+The phone's address can change when it reconnects, so if a check that used to pass fails, look at the app again.
+
+### 3. Place the phone
+
+Put it on a tripod or something else steady, 2-3 m to the side of the lane, level with the middle of the lane, and a little above the robot's height. Point it across the lane, so the robot crosses the picture from one side to the other. Frame the start mark and as far ahead as a good walk reaches. Leave it in the same place for the whole loop, so that the LLM can compare pictures between iterations.
+
+### 4. Check the stream
+
+Stand the robot at the start mark, then run:
+
+```bash
+python go2/phone_camera.py check http://192.168.1.23:8080/video
+```
+
+It reads the stream for 5 s and saves a frame as `camera_check.jpg`. Open the frame to check the view. A `PASS` means at least 10 frames per second arrived, with no gap over 0.5 s.
+
+| Message | What to try |
+|---|---|
+| `can't open ...` | Open the address in a browser on this computer. If the browser shows video, the address is fine. If it doesn't, check the address and that the app is streaming. If both are right, the network is keeping the devices apart, so see step 2. |
+| `opened but sent no frames` | Close any other viewer, such as a browser tab, because some apps serve one viewer at a time. |
+| `... frames/s is below 10` or `a ... s gap between frames` | Lower the app's resolution or quality, or move the phone or the computer closer to the Wi-Fi access point. |
+
+To try a recording, run `python go2/phone_camera.py record <address> test.mp4` and press Ctrl-C to stop it. Next to the video, `test.json` keeps when each frame arrived.
+
+### 5. Use it in the loop
+
+In S-M-ICRL's `func_config/go2/walk/walk_real.yaml`, set:
+
+```yaml
+llm:
+  send_images: true
+real_robot:
+  camera: http://192.168.1.23:8080/video
+```
+
+S-M-ICRL's `real_robot.md` explains what the loop does with the pictures.
+
+**Timing:** the recording runs alongside `run_policy.py` on the same computer, at a lower priority. In the simulator on a 12-core computer, the worst loop overrun stayed under 2 ms with and without it. On the robot, compare the `Timing` line of your first runs with the camera against your earlier runs.
