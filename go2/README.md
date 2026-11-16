@@ -267,7 +267,7 @@ These go straight to damping, which lets the robot sink to the ground:
 
 **Nothing protects the robot if the script is killed, the computer fails, or the cable comes out.** Stage 2 shows you what happens then.
 
-The script aims to keep torque within 60% of the limits (`--torque-fraction`). Peaks can go above that: the thigh reached about 21 N·m in simulation, against a 14 N·m target and a 23.7 N·m limit.
+The script aims to keep torque within 80% of the limits (`--torque-fraction`). Peaks can go above that. At the old 60% default the thigh reached about 21 N·m in simulation, against a 14 N·m target and a 23.7 N·m limit. On the robot, 60% held the thighs back for about half of each walk, so they often didn't finish a swing before the next policy call and the gait staggered. The 80% default hasn't been tried in simulation or on the robot yet. Expect thigh peaks at the 23.7 N·m limit, where the motor saturates.
 
 Each run saves its data to `go2/logs/<time>.npz`, including `rt/utlidar/robot_odom` when it publishes. Sport mode stays off after a run, so restart the robot to get it back.
 

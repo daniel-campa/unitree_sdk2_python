@@ -700,7 +700,7 @@ def parse_args():
                         help="policy rate, which sets this policy's gait (default: %(default)s)")
     parser.add_argument("--kp", type=bounded(1.0, 200.0), default=KP, help="default: %(default)s")
     parser.add_argument("--kd", type=bounded(0.0, 20.0), default=KD, help="default: %(default)s")
-    parser.add_argument("--torque-fraction", type=bounded(0.1, 1.0), default=0.6,
+    parser.add_argument("--torque-fraction", type=bounded(0.1, 1.0), default=0.8,
                         help="share of the torque limits to aim for; peaks can go above it "
                              "(default: %(default)s)")
     parser.add_argument("--probe-height", type=bounded(0.0, 1.0), default=PROBE_HEIGHT,
