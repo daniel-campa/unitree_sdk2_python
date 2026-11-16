@@ -245,7 +245,7 @@ These go straight to damping, which lets the robot sink to the ground:
 - Joint speed above 25 rad/s (hip, thigh) or 14 rad/s (calf)
 - A motor at 70 °C
 - A joint at its limit
-- No robot state for 0.1 s
+- No robot state for 0.1 s. An early robot run tripped this while standing, because of how the script read the state, not because of the robot. That's fixed but not yet retested on the robot. If it happens again, keep the log and note `oldest state` in the summary.
 - The control loop stalling for 0.2 s, or the policy failing
 
 **Nothing protects the robot if the script is killed, the computer fails, or the cable comes out.** Stage 2 shows you what happens then.

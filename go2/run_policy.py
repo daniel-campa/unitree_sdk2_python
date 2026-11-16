@@ -543,7 +543,7 @@ class OdomRecorder:
         self._lock = threading.Lock()
         self._rows = []
         self._subscriber = ChannelSubscriber(ODOM_TOPIC, Odometry_)
-        self._subscriber.Init(self, 10)
+        self._subscriber.Init(self)  # no queue: see the rt/lowstate subscriber below
 
     def __call__(self, msg):
         p, q = msg.pose.pose.position, msg.pose.pose.orientation
@@ -567,7 +567,9 @@ def connect(args):
     ChannelFactoryInitialize(domain, interface)
     monitor = StateMonitor()
     subscriber = ChannelSubscriber("rt/lowstate", LowState_)
-    subscriber.Init(monitor, 10)
+    # No queue. A queue length adds a reader thread that competes with the 500 Hz loop for the
+    # GIL. On the robot that held back state updates for 100 ms and tripped the stale-state fault.
+    subscriber.Init(monitor)
     deadline = time.perf_counter() + 5.0
     while monitor.msg is None:
         if time.perf_counter() > deadline:
