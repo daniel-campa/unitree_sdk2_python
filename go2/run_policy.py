@@ -110,6 +110,10 @@ LOG_FIELDS = ("t", "stage", "q", "dq", "target", "q_cmd", "tau_est", "temperatur
               "gyro", "accel", "foot_force", "power_v", "power_a")
 ODOM_TOPIC = "rt/utlidar/robot_odom"
 
+# Policy calls per probe in check_policy: 20 s at 10 Hz, past the start-up phase
+# of the policies so far (crab reads height and velocity from its fifth call).
+CHECK_CALLS = 200
+
 # The same limits S-M-ICRL applies when it runs generated policy code.
 POLICY_IMPORTS = ("numpy", "math", "random", "itertools", "functools", "collections", "copy")
 POLICY_BUILTINS = {
@@ -182,11 +186,19 @@ def read_state(msg):
     )
 
 
-def build_robot_state(state, start_yaw):
+def unmeasured_values(fill_height):
+    """robot_state[30:34] (vx, vy, vz, height): NaN, or constants with --fill-unmeasured."""
+    if fill_height is None:
+        return [np.nan] * 4
+    return [0.0, 0.0, 0.0, fill_height]
+
+
+def build_robot_state(state, start_yaw, fill_height=None):
     """Build S-M-ICRL's 37-element robot_state from what the robot can measure.
 
-    Linear velocity and height need sport mode or an estimator, so they are NaN.
-    check_policy refuses policies that use them.
+    Linear velocity and height need sport mode or an estimator. They are NaN, and
+    check_policy refuses policies that use them, unless fill_height is given: then
+    velocity is 0 and height is fill_height, as if the body never moved.
     """
     w, x, y, z = state.quaternion
     roll, pitch, yaw = state.rpy
@@ -195,7 +207,7 @@ def build_robot_state(state, start_yaw):
     up = [2.0 * (x * z - w * y), 2.0 * (y * z + w * x), 1.0 - 2.0 * (x * x + y * y)]
     return np.concatenate([
         state.q, state.dq, [roll, pitch, yaw_deviation], state.gyro,
-        [np.nan, np.nan, np.nan], [np.nan], up,
+        unmeasured_values(fill_height), up,
     ])
 
 
@@ -280,33 +292,52 @@ def load_policy(path):
     return catcher.policy
 
 
-def check_policy(path, env):
+def _check_outputs(path, robot_state, env):
+    """A fresh copy of the policy's targets over CHECK_CALLS calls with the same input."""
+    policy = load_policy(path)
+    return np.array([policy_target(policy, robot_state, env) for _ in range(CHECK_CALLS)])
+
+
+def check_policy(path, env, fill_height=None):
     """Refuse a policy that fails, or that depends on state the robot can't provide.
 
-    Each probe gets a fresh copy of the policy, so a policy that keeps its own state
-    between calls is compared on its first call only.
+    Each probe runs a fresh copy of the policy for CHECK_CALLS calls, so a policy
+    that keeps its own state, or only reads some inputs after a few calls, is
+    compared over all of them. With fill_height, the policy gets constants for that
+    state instead, so it may use it, but it must still be repeatable.
     """
     for thigh in (0.7, 0.9, 1.1):
         q = HOME.copy()
         q[1::3] = thigh
-        robot_state = np.concatenate([q, np.zeros(18), [np.nan] * 4, [0.0, 0.0, 1.0]])
-        reference = policy_target(load_policy(path), robot_state, env)
+        robot_state = np.concatenate([q, np.zeros(18), unmeasured_values(fill_height), [0.0, 0.0, 1.0]])
+        try:
+            reference = _check_outputs(path, robot_state, env)
+        except Fault as fault:
+            if fill_height is None and "non-finite" in str(fault):
+                raise Fault("it returned non-finite values when body height and linear velocity "
+                            "(robot_state[30:34]) were NaN, so it reads them, and the robot can't "
+                            "provide them (--fill-unmeasured feeds constants instead)") from fault
+            raise
+        if fill_height is not None:
+            if not np.array_equal(_check_outputs(path, robot_state, env), reference):
+                raise Fault("it isn't repeatable, for example because it uses random numbers")
+            continue
         for height, speed in ((0.1, -1.0), (0.4, 1.0)):
             probe = robot_state.copy()
             probe[30:33], probe[33] = speed, height
-            if not np.array_equal(policy_target(load_policy(path), probe, env), reference):
+            if not np.array_equal(_check_outputs(path, probe, env), reference):
                 raise Fault(
                     "its output changes with body height or linear velocity (robot_state[30:34]), "
-                    "which the robot can't provide, or it isn't repeatable, for example because "
-                    "it uses random numbers"
+                    "which the robot can't provide (--fill-unmeasured feeds constants instead), "
+                    "or it isn't repeatable, for example because it uses random numbers"
                 )
 
 
-def prepare_policy(path, env):
+def prepare_policy(path, env, fill_height=None):
     """Return a checked policy and the file's hash. A stalling policy trips the watchdog."""
     arm_watchdog(5.0)
     try:
-        check_policy(path, env)
+        check_policy(path, env, fill_height)
         policy = load_policy(path)  # a fresh copy, unaffected by the checks above
     except Exception as error:
         raise Refused(f"can't use policy {path}: {error}") from error
@@ -333,7 +364,7 @@ def format_legs(values):
     return " | ".join(f"{name} {leg}" for name, leg in zip(("FR", "FL", "RR", "RL"), legs))
 
 
-def dry_run(monitor, policy, env, policy_hz, seconds):
+def dry_run(monitor, policy, env, policy_hz, seconds, fill_height=None):
     """Print what the policy would command. This creates no publisher or SDK client."""
     print("Dry run: nothing is published, so this can't move the robot.", flush=True)
     start = time.perf_counter()
@@ -347,7 +378,7 @@ def dry_run(monitor, policy, env, policy_hz, seconds):
         if age > MAX_STATE_AGE:
             raise Fault(f"no robot state for {age * 1000:.0f} ms")
         state = read_state(monitor.msg)
-        target = policy_target(policy, build_robot_state(state, start_yaw), env)
+        target = policy_target(policy, build_robot_state(state, start_yaw, fill_height), env)
         if calls % max(1, round(policy_hz)) == 0:
             roll, pitch, _ = state.rpy
             print(f"t={elapsed:5.1f} s  roll={roll:+.2f}  pitch={pitch:+.2f}  "
@@ -473,7 +504,7 @@ class Controller:
         sys.stdin.readline()
         return True
 
-    def walk(self, policy, env, policy_hz, seconds):
+    def walk(self, policy, env, policy_hz, seconds, fill_height=None):
         start_yaw = self.latest_state(check_range=True).rpy[2]
         target = None
         next_call = 0
@@ -481,7 +512,7 @@ class Controller:
         def target_at(elapsed, state):
             nonlocal target, next_call
             if target is None or elapsed >= next_call / policy_hz:
-                robot_state = build_robot_state(state, start_yaw)
+                robot_state = build_robot_state(state, start_yaw, fill_height)
                 call_start = time.perf_counter()
                 new_target = policy_target(policy, robot_state, env)
                 self.worst_policy_time = max(self.worst_policy_time, time.perf_counter() - call_start)
@@ -494,13 +525,13 @@ class Controller:
 
         self.run_phase("walking", seconds, target_at)
 
-    def run_sequence(self, policy, env, policy_hz, seconds, ask_before_walking):
+    def run_sequence(self, policy, env, policy_hz, seconds, ask_before_walking, fill_height=None):
         self.move_to("standing up", HOME, STAND_UP_S, check_range=False)
         self.hold("settling", HOME, SETTLE_S)
         if seconds > 0:
             self.check_ready_to_walk()
             if not ask_before_walking or self.wait_for_go():
-                self.walk(policy, env, policy_hz, seconds)
+                self.walk(policy, env, policy_hz, seconds, fill_height)
                 self.move_to("returning home", HOME, RETURN_HOME_S)
                 self.hold("settling after walking", HOME, 1.0)
         self.move_to("lying down", LIE_DOWN, LIE_DOWN_S)
@@ -630,10 +661,13 @@ def prepare_robot(args, monitor, digest):
     battery = monitor.msg.bms_state.soc
     if battery < MIN_BATTERY_PERCENT:
         raise Refused(f"battery is at {battery}%, minimum {MIN_BATTERY_PERCENT}%")
+    inputs = ("" if args.fill_height is None else
+              f"  Inputs:  height fixed at {args.fill_height:g} m, body velocity at 0 (--fill-unmeasured)\n")
     print(f"\nTHIS WILL MOVE THE ROBOT on {args.robot}.\n"
           f"  Policy:  {args.policy} (sha256 {digest[:12]})\n"
           f"  Rate:    {args.policy_hz:g} Hz, kp {args.kp:g}, kd {args.kd:g}\n"
           f"  Torque:  capped at {args.torque_fraction:.0%} of the limits\n"
+          f"{inputs}"
           f"  Walking: {args.seconds:g} s; it will lie down first, then stand up\n"
           f"  Battery: {battery}%, hottest motor {state.temperature.max()} °C\n")
     if input('Type "yes" to continue: ').strip().lower() != "yes":
@@ -671,6 +705,10 @@ def parse_args():
                              "(default: %(default)s)")
     parser.add_argument("--probe-height", type=bounded(0.0, 1.0), default=PROBE_HEIGHT,
                         help="flat-floor terrain probes read minus this value (default: %(default)s)")
+    parser.add_argument("--fill-unmeasured", dest="fill_height", metavar="HEIGHT", nargs="?",
+                        type=bounded(0.05, 0.5), const=0.27,
+                        help="feed body velocity 0 and this base height in meters (if none is given: "
+                             "%(const)s) instead of refusing a policy that reads them")
     parser.add_argument("--domain", type=int, help="DDS domain id (default: 0 with --robot, otherwise 1)")
     parser.add_argument("--log", type=Path, help="where to save the run (default: go2/logs/<time>.npz)")
     return parser.parse_args()
@@ -683,13 +721,13 @@ def main():
     env = flat_floor_env(args.probe_height)
     original_mode = None
     try:
-        policy, digest = prepare_policy(args.policy, env)
+        policy, digest = prepare_policy(args.policy, env, args.fill_height)
         if args.check:
             print(f"Policy OK: {args.policy}", flush=True)
             return 0
         monitor, subscriber, odom = connect(args)
         if args.dry_run:
-            dry_run(monitor, policy, env, args.policy_hz, args.seconds)
+            dry_run(monitor, policy, env, args.policy_hz, args.seconds, args.fill_height)
             return 0
         if args.robot:
             original_mode = prepare_robot(args, monitor, digest)
@@ -706,7 +744,8 @@ def main():
     outcome = "finished"
     status = 0
     try:
-        controller.run_sequence(policy, env, args.policy_hz, args.seconds, ask_before_walking=bool(args.robot))
+        controller.run_sequence(policy, env, args.policy_hz, args.seconds,
+                                ask_before_walking=bool(args.robot), fill_height=args.fill_height)
     except Fault as fault:
         outcome, status = f"FAULT: {fault}", 1
     except KeyboardInterrupt:
@@ -730,6 +769,7 @@ def main():
         "policy": str(args.policy), "sha256": digest, "outcome": outcome, "interface": args.robot or "lo",
         "policy_hz": args.policy_hz, "kp": args.kp, "kd": args.kd, "seconds": args.seconds,
         "torque_fraction": args.torque_fraction, "probe_height": args.probe_height,
+        "fill_height": args.fill_height,
         "original_mode": original_mode,
         # "t" counts from this time.perf_counter() reading, so other programs' times,
         # such as go2/phone_camera.py's, can be matched to the log.

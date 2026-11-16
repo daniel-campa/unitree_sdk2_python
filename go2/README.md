@@ -173,7 +173,7 @@ Start the check about 3 s after `stand_test.py`, once the robot is standing. Wit
 
 The script feeds the policy fixed flat-floor values instead of real terrain probes, so **the robot can't sense steps or obstacles**.
 
-It refuses a policy whose output depends on body height or linear velocity (`robot_state[30:34]`), because the robot can't measure them. A policy may keep state between calls. `--check` only loads and checks the policy, without connecting to anything. S-M-ICRL's real-robot loop uses it before each run.
+It refuses a policy whose output depends on body height or linear velocity (`robot_state[30:34]`), because the robot can't measure them. It checks 200 calls of the policy, so it also catches a policy that only reads them after its start-up phase. `--fill-unmeasured` feeds velocity 0 and a base height of 0.27 m instead of refusing (`--fill-unmeasured 0.25` sets another height). The policy then runs as if its body never moved, so test it that way in simulation first. A policy may keep state between calls. `--check` only loads and checks the policy, without connecting to anything. S-M-ICRL's real-robot loop uses it before each run.
 
 ### Test in the simulator
 
@@ -235,6 +235,23 @@ python go2/run_policy.py go2/policies/walk_tmnxt_iter17.py --robot "$IFACE" --se
 - Clear a flat lane of about 8 x 4 m. Feet only lift about 2-3.5 cm, so remove cables and anything else above 1 cm.
 - Expect about 0.6 m/s and some sideways drift, because nothing corrects its heading. Drift reached about 1.6 m in simulation.
 - Keep someone ready to press B, and watch `hottest` and `current` in the output.
+
+### Crab (sideways walk)
+
+`policies/crab_biahd_iter35.py` is an unchanged copy of `iter_35/code.py` from the run `crab_2026-10-27_10-10-07_BIAHD`. It trots to its left in a 1.4 s cycle. It corrects its heading with the IMU, and corrects forward drift and body height with velocity and height, which the robot can't measure. So it needs `--fill-unmeasured`, and its own rate:
+
+```bash
+python go2/run_policy.py go2/policies/crab_biahd_iter35.py --policy-hz 10 --fill-unmeasured --torque-fraction 0.8 --seconds 17
+```
+
+Keep kp 80 and kd 4 (the defaults). The policy walks for 15.4 s after a 0.4 s settle, then holds its pose, so `--seconds 17` covers a whole run.
+
+What simulation shows, with velocity and height fixed:
+
+- **S-M-ICRL's simulator:** 4.2 m sideways in 17 s, against 4.4 m with the real values. Softer gains break it: at kp 60 / kd 5 it drifted 1.5 m forward and turned 1.1 rad, because the forward-drift correction that would catch this needs velocity.
+- **`sim_headless.py` (Unitree's model):** about 2.6 m sideways and 0.7-0.9 m forward, turning right by 0.55 rad (torque fraction 1.0) to 0.8 rad (0.8). At the default 0.6 the turn grew to 1.2 rad, and the run stopped at 13 s with a hip at its joint limit. Roll peaked at 0.47 rad in every run, close to the 0.5 rad tilt cutoff, so a tilt fault on the robot wouldn't be a surprise.
+
+On the robot, follow the same stages as [Test on the robot](#test-on-the-robot), with the crab command in place of the walk one. For stage 3, clear about 4 m to the robot's left and 2 m in front of it.
 
 ### What stops a run
 
