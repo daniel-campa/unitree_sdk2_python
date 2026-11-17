@@ -1,0 +1,97 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 840 580" font-family="Helvetica, Arial, sans-serif" font-size="14">
+<rect width="840" height="580" fill="#ffffff"/>
+<defs><marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#c0392b"/></marker></defs>
+<text x="60" y="40" font-size="17" font-weight="bold" fill="#222">Top view</text>
+<rect x="95" y="68" width="40" height="20" rx="6" fill="#9a9a9a" stroke="#555"/>
+<rect x="95" y="242" width="40" height="20" rx="6" fill="#9a9a9a" stroke="#555"/>
+<rect x="345" y="68" width="40" height="20" rx="6" fill="#9a9a9a" stroke="#555"/>
+<rect x="345" y="242" width="40" height="20" rx="6" fill="#9a9a9a" stroke="#555"/>
+<rect x="60" y="85" width="340" height="160" rx="30" fill="#d6d6d6" stroke="#555" stroke-width="2"/>
+<rect x="398" y="115" width="62" height="100" rx="22" fill="#b5b5b5" stroke="#555" stroke-width="2"/>
+<text x="429" y="170" text-anchor="middle" font-size="12" fill="#333">head</text>
+<text x="70" y="108" font-size="12" fill="#555">rear</text>
+<rect x="110" y="153" width="100" height="24" rx="12" fill="#7d7d7d" stroke="#444" stroke-width="2"/>
+<text x="160" y="146" text-anchor="middle" font-size="12" fill="#333">handle (keep clear)</text>
+<rect x="250.0" y="109.0" width="112" height="112" fill="#fff" stroke="#888" stroke-dasharray="4 3"/>
+<rect x="265.50" y="124.50" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="275.62" y="124.50" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="285.75" y="124.50" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="295.88" y="124.50" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="306.00" y="124.50" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="316.12" y="124.50" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="326.25" y="124.50" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="336.38" y="124.50" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="265.50" y="134.62" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="295.88" y="134.62" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="306.00" y="134.62" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="316.12" y="134.62" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="326.25" y="134.62" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="336.38" y="134.62" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="265.50" y="144.75" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="275.62" y="144.75" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="285.75" y="144.75" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="295.88" y="144.75" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="306.00" y="144.75" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="326.25" y="144.75" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="336.38" y="144.75" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="265.50" y="154.88" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="295.88" y="154.88" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="306.00" y="154.88" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="336.38" y="154.88" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="265.50" y="165.00" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="275.62" y="165.00" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="316.12" y="165.00" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="326.25" y="165.00" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="336.38" y="165.00" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="265.50" y="175.12" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="306.00" y="175.12" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="326.25" y="175.12" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="336.38" y="175.12" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="265.50" y="185.25" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="285.75" y="185.25" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="295.88" y="185.25" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="316.12" y="185.25" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="326.25" y="185.25" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="336.38" y="185.25" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="265.50" y="195.38" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="275.62" y="195.38" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="285.75" y="195.38" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="295.88" y="195.38" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="306.00" y="195.38" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="316.12" y="195.38" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="326.25" y="195.38" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<rect x="336.38" y="195.38" width="11.12" height="11.12" fill="#000" shape-rendering="crispEdges"/>
+<line x1="282" y1="97.0" x2="346" y2="97.0" stroke="#c0392b" stroke-width="4" marker-end="url(#ah)"/>
+<text x="276" y="97.0" text-anchor="end" dominant-baseline="middle" font-size="12" fill="#c0392b">arrow to head</text>
+<line x1="306" y1="221.0" x2="306" y2="245" stroke="#2c7fb8" stroke-dasharray="3 3"/>
+<text x="250" y="275" text-anchor="middle" font-size="12" fill="#2c7fb8">between the handle and the head, centred left to right</text>
+<text x="60" y="325" font-size="17" font-weight="bold" fill="#222">Side view</text>
+<polyline points="115,440 87,495 120,539" fill="none" stroke="#666" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+<polyline points="355,440 327,495 360,539" fill="none" stroke="#666" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+<rect x="60" y="385" width="340" height="62" rx="16" fill="#d6d6d6" stroke="#555" stroke-width="2"/>
+<rect x="398" y="390" width="62" height="52" rx="16" fill="#b5b5b5" stroke="#555" stroke-width="2"/>
+<circle cx="452" cy="434" r="9" fill="#333"/>
+<text x="472" y="452" font-size="12" fill="#333">lidar</text>
+<path d="M110,385 C110,345 210,345 210,385" fill="none" stroke="#555" stroke-width="7" stroke-linecap="round"/>
+<text x="160" y="342" text-anchor="middle" font-size="12" fill="#333">handle</text>
+<rect x="250.0" y="379" width="112" height="6" fill="#111"/>
+<text x="306" y="368" text-anchor="middle" font-size="12" fill="#111">tag card: flat, face up</text>
+<line x1="40" y1="545" x2="500" y2="545" stroke="#999" stroke-width="2"/>
+<text x="530" y="62" fill="#222" font-weight="bold">Robot tag: page 1 of the tag sheets</text>
+<text x="530" y="84" fill="#222">(tag36h11 ID 0, black square 120 mm)</text>
+<text x="530" y="106" fill="#222"></text>
+<text x="530" y="128" fill="#222">• Glue it to stiff card first</text>
+<text x="530" y="150" fill="#222">• Tape it flat on the back between the</text>
+<text x="544" y="172" fill="#222">handle and the head, all four edges down</text>
+<text x="530" y="194" fill="#222">• Don't cover the handle</text>
+<text x="530" y="216" fill="#222">• Centre it left to right</text>
+<text x="530" y="238" fill="#222">• Arrow points to the head</text>
+<text x="530" y="260" fill="#222">• Keep it low and flat, so it doesn't block</text>
+<text x="544" y="282" fill="#222">the lidar's view</text>
+<text x="530" y="304" fill="#222">• Keep the white border showing all round</text>
+<text x="530" y="326" fill="#222"></text>
+<text x="530" y="348" fill="#222">The phone films it from above and to the side,</text>
+<text x="530" y="370" fill="#222">so nothing should cover or shade it.</text>
+<text x="530" y="392" fill="#222"></text>
+<text x="530" y="414" fill="#222">Not to scale.</text>
+</svg>

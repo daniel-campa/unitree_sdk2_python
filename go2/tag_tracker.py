@@ -1,0 +1,422 @@
+#!/usr/bin/env python
+"""Measure where the Go2 walked from a phone video of AprilTags. Never touches the robot.
+
+The robot has no position measurement once run_policy.py releases sport mode
+(check_odom.py showed that every odometry topic stops). This script measures it from
+outside instead. A phone on a tripod films the lane, recorded with phone_camera.py.
+One tag is on the robot's back and one lies flat on the floor. Print both with
+go2/make_tag_sheets.py.
+
+    python go2/tag_tracker.py calibrate CALIB.mp4                 # once per phone and zoom; writes go2/logs/camera.json
+    python go2/tag_tracker.py track WALK.mp4                      # robot tag relative to the floor tag
+    python go2/tag_tracker.py track WALK.mp4 --run go2/logs/RUN.npz   # also report the policy's walk
+
+CALIB.mp4 is a phone_camera.py recording of the printed checkerboard, held flat and
+moved slowly all over the picture at different tilts. Record it with the same
+--max-width as the walk videos, because the calibration belongs to that picture size.
+
+track writes WALK_track.npz (and WALK_track.png) next to the video. Positions are in
+the floor tag's frame: forward along its arrow, left of it, up from the floor, and the
+robot tag's yaw from the arrow (anticlockwise seen from above). Times are the frames'
+arrival times from WALK.json, on time.perf_counter() like run_policy.py's log, minus
+--latency. With --run, it reports the forward and left distance over the log's
+walking stage, along the robot's heading at the start, and the walk reward's
+distance terms as check_odom.py computes them.
+
+Exit status: 0 = done, 1 = calibration or tracking failed.
+"""
+import argparse
+import json
+import math
+import sys
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+LOG_DIR = Path(__file__).resolve().parent / "logs"
+DEFAULT_CAMERA = LOG_DIR / "camera.json"
+
+ROBOT_TAG_ID, ROBOT_TAG_M = 0, 0.120  # black square edge, as printed by make_tag_sheets.py
+FLOOR_TAG_ID, FLOOR_TAG_M = 1, 0.140
+BOARD_INNER = (6, 8)  # inner corners of make_tag_sheets.py's 7 x 9 board
+BOARD_SQUARE_MM = 25.0
+
+CALIB_SAMPLES = 120  # frames looked at for the board
+CALIB_MIN_VIEWS = 12
+CALIB_MIN_SHIFT_PX = 25.0  # a view must move the board this far from every kept view
+CALIB_MAX_RMS_PX = 1.0
+CALIB_MIN_COVERAGE = 0.5  # fraction of the picture the board's corners should reach
+
+FLOOR_MOVED_PX = 3.0  # floor tag corners further than this from their median: camera or tag moved
+FLOOR_MOVED_FRACTION = 0.05
+MIN_ROBOT_DETECTION = 0.5  # of frames, below which tracking fails
+ENDPOINT_S = 0.25  # positions at the ends of the walk are line fits over this long either side
+REWARD_FILTERS = (0.0, 0.5)  # s; frame-to-frame noise counts as sideways and backward steps, so raw reads low
+
+
+class TrackError(Exception):
+    pass
+
+
+def tag_object_points(side):
+    """Corner order of OpenCV's detector and SOLVEPNP_IPPE_SQUARE: x right, y towards the arrow."""
+    h = side / 2.0
+    return np.array([[-h, h, 0.0], [h, h, 0.0], [h, -h, 0.0], [-h, -h, 0.0]])
+
+
+def read_frames(path, every=1):
+    capture = cv2.VideoCapture(str(path))
+    if not capture.isOpened():
+        raise TrackError(f"can't open {path}")
+    index = 0
+    try:
+        while True:
+            ok, frame = capture.read()
+            if not ok:
+                return
+            if index % every == 0:
+                yield index, frame
+            index += 1
+    finally:
+        capture.release()
+
+
+def frame_count(path):
+    capture = cv2.VideoCapture(str(path))
+    count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+    capture.release()
+    return count
+
+
+# Calibration ---------------------------------------------------------------------
+def calibrate(args):
+    total = frame_count(args.video)
+    every = max(1, total // CALIB_SAMPLES)
+    board = np.zeros((BOARD_INNER[0] * BOARD_INNER[1], 3), np.float32)
+    board[:, :2] = np.mgrid[0:BOARD_INNER[0], 0:BOARD_INNER[1]].T.reshape(-1, 2) * args.square_mm / 1000.0
+    views, centres, size, looked = [], [], None, 0
+    for _, frame in read_frames(args.video, every):
+        looked += 1
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        size = gray.shape[::-1]
+        found, corners = cv2.findChessboardCornersSB(gray, BOARD_INNER, flags=cv2.CALIB_CB_NORMALIZE_IMAGE)
+        if not found:
+            continue
+        centre = corners.reshape(-1, 2).mean(axis=0)
+        if any(np.linalg.norm(centre - c) < CALIB_MIN_SHIFT_PX for c in centres):
+            continue
+        views.append(corners)
+        centres.append(centre)
+    print(f"Board found in {len(views)} distinct views of {looked} frames looked at.")
+    if len(views) < CALIB_MIN_VIEWS:
+        raise TrackError(f"need at least {CALIB_MIN_VIEWS} views. Move the board slowly over the whole "
+                         "picture, at different tilts, and keep all of it in view.")
+    rms, matrix, dist, _, _ = cv2.calibrateCamera([board] * len(views), views, size, None, None)
+    reach = np.concatenate([v.reshape(-1, 2) for v in views])
+    coverage = float((reach[:, 0].max() - reach[:, 0].min()) * (reach[:, 1].max() - reach[:, 1].min())
+                     / (size[0] * size[1]))
+    camera = {"size": list(size), "matrix": matrix.tolist(), "dist": dist.ravel().tolist(), "rms_px": rms,
+              "views": len(views), "coverage": coverage, "square_mm": args.square_mm, "video": str(args.video)}
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(json.dumps(camera, indent=1))
+    fov = 2 * math.degrees(math.atan(size[0] / 2 / matrix[0, 0]))
+    print(f"Picture {size[0]}x{size[1]}, focal length {matrix[0, 0]:.0f} px ({fov:.0f} deg wide), "
+          f"reprojection error {rms:.2f} px, corners reach {coverage:.0%} of the picture.")
+    print(f"Wrote {args.out}")
+    problems = []
+    if rms > CALIB_MAX_RMS_PX:
+        problems.append(f"reprojection error {rms:.2f} px is above {CALIB_MAX_RMS_PX:g}: blurred frames, "
+                        "a board that isn't flat, or the wrong --square-mm")
+    if coverage < CALIB_MIN_COVERAGE:
+        problems.append(f"the board only reached {coverage:.0%} of the picture; take it closer to the edges")
+    if problems:
+        print("FAIL: " + "; ".join(problems))
+        return 1
+    print("PASS")
+    return 0
+
+
+def load_camera(path, size):
+    """Camera matrix and distortion for this picture size, scaled if only the resolution differs."""
+    if not path.exists():
+        raise TrackError(f"no camera calibration at {path}. Run: python go2/tag_tracker.py calibrate CALIB.mp4")
+    camera = json.loads(path.read_text())
+    matrix, dist = np.array(camera["matrix"]), np.array(camera["dist"])
+    width, height = camera["size"]
+    if (width, height) != tuple(size):
+        sx, sy = size[0] / width, size[1] / height
+        if abs(sx - sy) > 0.01:
+            raise TrackError(f"{path} is for {width}x{height} pictures, but the video is {size[0]}x{size[1]}, "
+                             "a different shape. Calibrate again with the same --max-width.")
+        matrix = matrix * np.array([[sx], [sy], [1.0]])
+        print(f"Scaled the {width}x{height} calibration to {size[0]}x{size[1]}.")
+    return matrix, dist
+
+
+# Tracking ------------------------------------------------------------------------
+def make_detector():
+    params = cv2.aruco.DetectorParameters()
+    params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
+    return cv2.aruco.ArucoDetector(dictionary, params)
+
+
+def detect_all(path, robot_id, floor_id, annotate=None):
+    """Corners of each tag in each frame (NaN where unseen), and the picture size."""
+    detector = make_detector()
+    robot, floor, size = [], [], None
+    for _, frame in read_frames(path):
+        size = frame.shape[1::-1]
+        corners, ids, _ = detector.detectMarkers(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+        seen = {} if ids is None else {int(i): c.reshape(4, 2) for i, c in zip(ids.ravel(), corners)}
+        robot.append(seen.get(robot_id, np.full((4, 2), np.nan)))
+        floor.append(seen.get(floor_id, np.full((4, 2), np.nan)))
+        if annotate is not None:
+            annotate.append(frame)
+    if size is None:
+        raise TrackError(f"{path} has no frames")
+    return np.array(robot), np.array(floor), size
+
+
+def solve_tag(corners, side, matrix, dist):
+    """Both IPPE solutions as (R, t, reprojection error), best first."""
+    ok, rvecs, tvecs, errors = cv2.solvePnPGeneric(tag_object_points(side), corners.astype(np.float64),
+                                                    matrix, dist, flags=cv2.SOLVEPNP_IPPE_SQUARE)
+    if not ok:
+        return []
+    return [(cv2.Rodrigues(r)[0], t.ravel(), float(e)) for r, t, e in zip(rvecs, tvecs, np.ravel(errors))]
+
+
+def floor_pose(floor, matrix, dist, side):
+    """The floor tag's pose from its median corners, which assumes the camera stayed put."""
+    seen = ~np.isnan(floor[:, 0, 0])
+    if not seen.any():
+        raise TrackError(f"the floor tag (ID {FLOOR_TAG_ID}) was never seen")
+    median = np.median(floor[seen], axis=0)
+    deviation = np.abs(floor[seen] - median).max(axis=(1, 2))
+    moved = float((deviation > FLOOR_MOVED_PX).mean())
+    solutions = solve_tag(median, side, matrix, dist)
+    if not solutions:
+        raise TrackError("couldn't solve the floor tag's pose")
+    rotation, translation, error = solutions[0]
+    info = {"seen_fraction": float(seen.mean()), "moved_fraction": moved,
+            "jitter_px": float(np.median(deviation)), "reprojection_px": error,
+            "distance_m": float(np.linalg.norm(translation)),
+            "view_angle_deg": math.degrees(math.acos(abs(rotation[2, 2])))}
+    if len(solutions) > 1:
+        info["ambiguity"] = solutions[1][2] / max(error, 1e-9)
+    return rotation, translation, info
+
+
+def robot_poses(robot, floor_rotation, floor_translation, matrix, dist, side):
+    """Robot tag positions and angles in the floor tag's frame, NaN where unseen."""
+    n = len(robot)
+    out = {k: np.full(n, np.nan) for k in ("forward", "left", "up", "yaw", "tilt", "reprojection_px")}
+    floor_up = floor_rotation[:, 2]
+    for i in np.flatnonzero(~np.isnan(robot[:, 0, 0])):
+        solutions = solve_tag(robot[i], side, matrix, dist)
+        if not solutions:
+            continue
+        # The tag lies nearly flat on the robot's back, so of IPPE's two solutions,
+        # take the one whose face points most nearly the same way as the floor's.
+        rotation, translation, error = max(solutions, key=lambda s: s[0][:, 2] @ floor_up)
+        position = floor_rotation.T @ (translation - floor_translation)
+        in_floor = floor_rotation.T @ rotation
+        heading = in_floor[:, 1]
+        out["forward"][i], out["left"][i], out["up"][i] = position[1], -position[0], position[2]
+        out["yaw"][i] = math.atan2(-heading[0], heading[1])
+        out["tilt"][i] = math.acos(np.clip(in_floor[2, 2], -1.0, 1.0))
+        out["reprojection_px"][i] = error
+    return out
+
+
+def frame_times(video, count, latency):
+    timeline_path = video.with_suffix(".json")
+    if not timeline_path.exists():
+        print(f"No {timeline_path.name}, so times count from the first frame at the video's frame rate, "
+              "not on run_policy.py's clock.")
+        capture = cv2.VideoCapture(str(video))
+        fps = capture.get(cv2.CAP_PROP_FPS) or 15.0
+        capture.release()
+        return np.arange(count) / fps, False
+    received = np.array(json.loads(timeline_path.read_text())["received_at"], float)
+    if len(received) < count:
+        raise TrackError(f"{timeline_path.name} has {len(received)} times for {count} frames")
+    return received[:count] - latency, True
+
+
+def load_walk(path):
+    """Start and end of the walking stage on time.perf_counter(), and the run's outcome."""
+    log = np.load(path, allow_pickle=True)
+    meta = json.loads(str(log["meta"]))
+    stages = np.array([str(s) for s in log["stage"]])
+    walking = np.flatnonzero(stages == "walking")
+    if len(walking) == 0:
+        raise TrackError(f"{path} has no walking stage (outcome: {meta.get('outcome')})")
+    t = log["t"] + meta["clock_start"]
+    return t[walking[0]], t[walking[-1]], meta.get("outcome", "?")
+
+
+def value_at(t, values, at, seen):
+    """A straight line fitted to the frames within ENDPOINT_S of at, evaluated at at; None if none."""
+    window = seen & (np.abs(t - at) <= ENDPOINT_S)
+    if not window.any():
+        return None
+    if window.sum() == 1:
+        return values[window][0]
+    slope, offset = np.polyfit(t[window] - at, values[window], 1)
+    return offset
+
+
+def report_walk(t, track, seen, start, end, outcome):
+    print(f"\nWalk {end - start:.1f} s ({outcome})")
+    inside = (t >= start) & (t <= end)
+    if not inside.any():
+        raise TrackError("the video doesn't cover the walk. Check that both ran on this computer, "
+                         "since perf_counter() times only line up on one machine.")
+    print(f"  robot tag seen in {seen[inside].mean():.0%} of the walk's frames")
+    xy = np.column_stack([track["forward"], track["left"]])
+    first, last = value_at(t, xy, start, seen), value_at(t, xy, end, seen)
+    yaw = np.full(len(t), np.nan)
+    yaw[seen] = np.unwrap(track["yaw"][seen])
+    yaw_first, yaw_last = value_at(t, yaw, start, seen), value_at(t, yaw, end, seen)
+    if first is None or last is None:
+        print(f"  robot tag not seen within {ENDPOINT_S:g} s of the start or the end, so no distance")
+        return
+    c, s = math.cos(yaw_first), math.sin(yaw_first)
+    d = last - first
+    forward, left = d[0] * c + d[1] * s, -d[0] * s + d[1] * c
+    turned = math.degrees(yaw_last - yaw_first)
+    print(f"  along the starting heading: {forward:+.3f} m forward, {left:+.3f} m left, turned {turned:+.1f} deg")
+    print(f"  (in the floor tag's frame: {d[0]:+.3f} m forward, {d[1]:+.3f} m left)")
+    use = inside & seen
+    if use.sum() < 2:
+        return
+    from check_odom import EPISODE_S, noise_reward
+    tw = t[use]
+    rel = xy[use] - first
+    f, l = rel[:, 0] * c + rel[:, 1] * s, -rel[:, 0] * s + rel[:, 1] * c
+    rewards = "  ".join(f"{w:g} s filter {noise_reward(tw, f, l, w):+.2f}" for w in REWARD_FILTERS)
+    print(f"  walk reward distance terms per {EPISODE_S:g} s, stability gate assumed open: {rewards}")
+
+
+def save_plot(path, t, track, seen, walk):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    figure, axes = plt.subplots(4, 1, figsize=(10, 9), sharex=True)
+    t0 = t[0]
+    rows = [("forward", "forward (m)", 1.0), ("left", "left (m)", 1.0), ("yaw", "yaw (deg)", 180 / math.pi),
+            ("up", "tag height (m)", 1.0)]
+    for axis, (key, label, scale) in zip(axes, rows):
+        axis.plot(t[seen] - t0, track[key][seen] * scale, ".", ms=2)
+        axis.set_ylabel(label)
+        axis.grid(alpha=0.3)
+        if walk is not None:
+            axis.axvspan(walk[0] - t0, walk[1] - t0, color="tab:blue", alpha=0.15)
+    axes[-1].set_xlabel("time since the first frame (s); blue = walking stage")
+    figure.tight_layout()
+    figure.savefig(path, dpi=110)
+    plt.close(figure)
+    print(f"Plot: {path}")
+
+
+def write_annotated(path, frames, robot, floor, matrix, dist, floor_rotation, floor_translation, fps):
+    height, width = frames[0].shape[:2]
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    rvec = cv2.Rodrigues(floor_rotation)[0]
+    for frame, r, f in zip(frames, robot, floor):
+        for corners, colour in ((r, (0, 0, 255)), (f, (0, 255, 0))):
+            if not np.isnan(corners[0, 0]):
+                cv2.polylines(frame, [corners.astype(np.int32)], True, colour, 2)
+        cv2.drawFrameAxes(frame, matrix, dist, rvec, floor_translation, 0.3, 2)
+        writer.write(frame)
+    writer.release()
+    print(f"Annotated video: {path} (red = robot tag, green = floor tag; floor axes x red, y green, z blue)")
+
+
+def track(args):
+    frames = [] if args.annotate else None
+    robot, floor, size = detect_all(args.video, args.robot_id, args.floor_id, frames)
+    matrix, dist = load_camera(args.camera, size)
+    t, on_run_clock = frame_times(args.video, len(robot), args.latency)
+    floor_rotation, floor_translation, floor_info = floor_pose(floor, matrix, dist, args.floor_size_m)
+    track = robot_poses(robot, floor_rotation, floor_translation, matrix, dist, args.robot_size_m)
+    seen = ~np.isnan(track["forward"])
+
+    print(f"{len(t)} frames over {t[-1] - t[0]:.1f} s. Robot tag seen in {seen.mean():.0%}, "
+          f"floor tag in {floor_info['seen_fraction']:.0%}.")
+    print(f"Floor tag {floor_info['distance_m']:.2f} m from the camera, seen {floor_info['view_angle_deg']:.0f} deg "
+          f"off straight-on, corner jitter {floor_info['jitter_px']:.1f} px.")
+    if floor_info["moved_fraction"] > FLOOR_MOVED_FRACTION:
+        print(f"WARNING: in {floor_info['moved_fraction']:.0%} of the frames the floor tag was over "
+              f"{FLOOR_MOVED_PX:g} px from where it usually is. The camera or the tag moved, or the robot "
+              "covered part of it, and positions will be off.")
+    if seen.any():
+        reproj = np.nanmedian(track["reprojection_px"])
+        print(f"Robot tag reprojection error median {reproj:.2f} px, tilt median "
+              f"{math.degrees(np.nanmedian(track['tilt'])):.1f} deg, height median {np.nanmedian(track['up']):.3f} m.")
+        i, j = np.flatnonzero(seen)[[0, -1]]
+        print(f"First seen at {track['forward'][i]:+.3f} m forward, {track['left'][i]:+.3f} m left; "
+              f"last at {track['forward'][j]:+.3f} m forward, {track['left'][j]:+.3f} m left.")
+
+    walk = None
+    if args.run:
+        if not on_run_clock:
+            raise TrackError("--run needs the video's .json timeline from phone_camera.py record")
+        start, end, outcome = load_walk(args.run)
+        walk = (start, end)
+        report_walk(t, track, seen, start, end, outcome)
+
+    out = args.video.with_name(args.video.stem + "_track.npz")
+    meta = {"video": str(args.video), "camera": str(args.camera), "latency_s": args.latency,
+            "robot_tag": [args.robot_id, args.robot_size_m], "floor_tag": [args.floor_id, args.floor_size_m],
+            "floor": floor_info, "clock": "time.perf_counter" if on_run_clock else "video",
+            "run": str(args.run) if args.run else None}
+    np.savez_compressed(out, meta=json.dumps(meta), t=t, seen=seen, **track)
+    print(f"Wrote {out}")
+    if not args.no_plot:
+        save_plot(out.with_suffix(".png"), t, track, seen, walk)
+    if args.annotate:
+        fps = (len(t) - 1) / (t[-1] - t[0]) if len(t) > 1 and t[-1] > t[0] else 15.0
+        write_annotated(args.annotate, frames, robot, floor, matrix, dist, floor_rotation, floor_translation, fps)
+    if seen.mean() < MIN_ROBOT_DETECTION:
+        print(f"FAIL: the robot tag was seen in only {seen.mean():.0%} of frames. Check the light, the focus "
+              "and that the tag faces the camera.")
+        return 1
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    commands = parser.add_subparsers(dest="command", required=True)
+    cal = commands.add_parser("calibrate", help="calibrate the camera from a video of the checkerboard")
+    cal.add_argument("video", type=Path)
+    cal.add_argument("--square-mm", type=float, default=BOARD_SQUARE_MM,
+                     help="measured size of one printed square (default: %(default)s)")
+    cal.add_argument("--out", type=Path, default=DEFAULT_CAMERA, help="(default: go2/logs/camera.json)")
+    trk = commands.add_parser("track", help="track the robot tag in a walk video")
+    trk.add_argument("video", type=Path)
+    trk.add_argument("--camera", type=Path, default=DEFAULT_CAMERA, help="(default: go2/logs/camera.json)")
+    trk.add_argument("--run", type=Path, help="run_policy.py log whose walking stage to report")
+    trk.add_argument("--latency", type=float, default=0.0,
+                     help="seconds the stream lags the robot, taken off the frame times (default: %(default)s)")
+    trk.add_argument("--robot-id", type=int, default=ROBOT_TAG_ID)
+    trk.add_argument("--floor-id", type=int, default=FLOOR_TAG_ID)
+    trk.add_argument("--robot-size-m", type=float, default=ROBOT_TAG_M,
+                     help="measured black square of the robot tag (default: %(default)s)")
+    trk.add_argument("--floor-size-m", type=float, default=FLOOR_TAG_M,
+                     help="measured black square of the floor tag (default: %(default)s)")
+    trk.add_argument("--annotate", type=Path, help="also write a video with the tags outlined, to check by eye")
+    trk.add_argument("--no-plot", action="store_true", help="don't save a plot")
+    args = parser.parse_args()
+    try:
+        return calibrate(args) if args.command == "calibrate" else track(args)
+    except TrackError as error:
+        print(f"FAIL: {error}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

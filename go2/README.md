@@ -2,7 +2,7 @@
 
 Follow these steps on the Ubuntu computer wired to the robot. They end with a read-only check that sends no commands to the robot.
 
-**Don't run other scripts yet.** Unitree's examples can move the robot as soon as you give them a network interface. `stand_test.py` only works with the simulator, so it can't reach the robot. `run_policy.py` only reaches the robot if you pass `--robot`, and [Run a policy](#run-a-policy) covers when to do that. `check_lidar.py` and `lidar_map.py` are also read-only, and [Check the lidar](#check-the-lidar) covers them. So is `check_odom.py`, which [Check the odometry](#check-the-odometry) covers. `phone_camera.py` never talks to the robot, and [Film with a phone](#film-with-a-phone) covers it.
+**Don't run other scripts yet.** Unitree's examples can move the robot as soon as you give them a network interface. `stand_test.py` only works with the simulator, so it can't reach the robot. `run_policy.py` only reaches the robot if you pass `--robot`, and [Run a policy](#run-a-policy) covers when to do that. `check_lidar.py` and `lidar_map.py` are also read-only, and [Check the lidar](#check-the-lidar) covers them. So is `check_odom.py`, which [Check the odometry](#check-the-odometry) covers. `phone_camera.py` never talks to the robot, and [Film with a phone](#film-with-a-phone) covers it. `tag_tracker.py` and `make_tag_sheets.py` only read videos and write files, and [Measure the walk with AprilTags](#measure-the-walk-with-apriltags) covers them.
 
 ## 1. Install
 
@@ -383,3 +383,65 @@ real_robot:
 S-M-ICRL's `real_robot.md` explains what the loop does with the pictures.
 
 **Timing:** the recording runs alongside `run_policy.py` on the same computer, at a lower priority. In the simulator on a 12-core computer, the worst loop overrun stayed under 2 ms with and without it. On the robot, compare the `Timing` line of your first runs with the camera against your earlier runs.
+
+## Measure the walk with AprilTags
+
+Once `run_policy.py` releases sport mode, the robot reports no position: [Check the odometry](#check-the-odometry) found that `rt/utlidar/robot_odom`, `rt/utlidar/robot_pose` and `rt/sportmodestate` all stop. `tag_tracker.py` measures the walk from outside instead. The phone from [Film with a phone](#film-with-a-phone) films a tag on the robot's back and a tag on the floor, and the script works out where the robot tag was relative to the floor tag in each frame. It never talks to the robot.
+
+**This hasn't been tried with a real camera or robot.** It has only tracked synthetic videos, rendered from the printed sheets with a known path and lens distortion. There, a 1.8 m walk measured 1.77-1.78 m, the sideways drift came within 4 cm and the turn within 1.5 deg, and calibration recovered the focal length to 0.4%.
+
+### 1. Print the sheets
+
+`go2/tags/tag_sheets_a4.pdf` and `go2/tags/tag_sheets_letter.pdf` are ready to print (`python go2/make_tag_sheets.py` rebuilds them). Print at **100% / actual size**, never "fit to page", on matte paper. Each page has a 100 mm bar: measure it.
+
+| Page | What | Where it goes |
+|---|---|---|
+| 1 | Robot tag, ID 0, black square 120 mm | Glued to stiff card, taped flat on the back between the handle and the head, centred, arrow towards the head. Not over the handle |
+| 2 | Floor tag, ID 1, black square 140 mm | Glued to stiff card, flat on the floor beside the lane on the camera's side, arrow along the lane. The robot mustn't cover it. Don't move it during a session |
+| 3 | Checkerboard, 25 mm squares | Glued flat to stiff card, for calibrating the camera |
+
+![Where the robot tag goes: flat on the back between the handle and the head, face up, arrow towards the head](tags/tag_placement.svg)
+
+Measure each black square and each checkerboard square with a ruler. If they're not 120 mm, 140 mm and 25 mm, pass what you measured as `--robot-size-m`, `--floor-size-m` and `--square-mm`. A 2% size error becomes a 2% distance error.
+
+### 2. Place the phone
+
+As in [Place the phone](#3-place-the-phone), but higher: 1.5-2 m up, tilted down, 2-3 m from the lane, so it sees the robot's back from above. Keep it closer if you can: each tag should be at least 40 px across in the picture. Lock focus and exposure in the app, and light the lane well, so the trot doesn't blur the tag.
+
+### 3. Calibrate the camera (once per phone, zoom and resolution)
+
+Record the checkerboard with the same settings as the walks (the same app resolution and `--max-width`):
+
+```bash
+python go2/phone_camera.py record <address> go2/logs/calib.mp4    # Ctrl-C after about a minute
+python go2/tag_tracker.py calibrate go2/logs/calib.mp4
+```
+
+While it records, hold the board flat and move it slowly over the whole picture, corners included, tilting it up to about 40 deg each way, at 0.5-1 m from the phone. It writes `go2/logs/camera.json`. A `PASS` means the reprojection error is under 1 px and the board reached at least half of the picture. Moving the phone is fine. Changing the zoom or resolution means calibrating again.
+
+### 4. Track a walk
+
+Record while `run_policy.py` runs, then track the video against the run's log:
+
+```bash
+python go2/phone_camera.py record <address> go2/logs/walk.mp4      # start it before run_policy.py, Ctrl-C after
+python go2/tag_tracker.py track go2/logs/walk.mp4 --run go2/logs/<run>.npz --annotate go2/logs/walk_annotated.mp4
+```
+
+Both must run on the same computer, because the times line up on its `time.perf_counter()`. The report gives:
+
+- How often each tag was seen, how far the floor tag is from the camera, and how steady it stayed.
+- Over the log's `walking` stage: the distance forward and left along the robot's heading at the start, and how far it turned.
+- The walk reward's distance terms per 5 s, as `check_odom.py` computes them, raw and with a 0.5 s moving average. Frame-to-frame noise counts as sideways and backward steps, so the raw number reads low. In the synthetic test it gave 12-14 where the true value was 16, and the 0.5 s average gave 15.7-16.
+
+It saves `walk_track.npz` (time, forward, left, up, yaw and tilt for each frame) and `walk_track.png`. Watch the `--annotate` video the first time: the robot tag should have a red outline, the floor tag a green one, and the floor tag's green axis should point along the lane.
+
+The frame times are when frames arrived, so they lag the robot by the stream's delay. Distances over the whole walk are hardly affected, but `--latency SECONDS` takes a known delay off.
+
+| Message | What to try |
+|---|---|
+| `the floor tag (ID 1) was never seen` | Check that it's in the picture, that it was printed at 100%, and that its white border wasn't cut off. Move the phone closer. |
+| `the floor tag was over 3 px from where it usually is` | The phone moved, the floor tag was moved, or the robot walked over it. Fix whichever it was, and record again. |
+| `the robot tag was seen in only ...` | More light, lock focus, bring the phone closer or higher, and check that the tag lies flat. |
+| `... is for WxH pictures, but the video is ...` | The calibration was made at a different resolution. Calibrate again with the same settings. |
+| `the video doesn't cover the walk` | Start the recording before `run_policy.py`, on the same computer. |
