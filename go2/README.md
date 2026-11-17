@@ -2,7 +2,7 @@
 
 Follow these steps on the Ubuntu computer wired to the robot. They end with a read-only check that sends no commands to the robot.
 
-**Don't run other scripts yet.** Unitree's examples can move the robot as soon as you give them a network interface. `stand_test.py` only works with the simulator, so it can't reach the robot. `run_policy.py` only reaches the robot if you pass `--robot`, and [Run a policy](#run-a-policy) covers when to do that. `check_lidar.py` and `lidar_map.py` are also read-only, and [Check the lidar](#check-the-lidar) covers them. So is `check_odom.py`, which [Check the odometry](#check-the-odometry) covers. `phone_camera.py` never talks to the robot, and [Film with a phone](#film-with-a-phone) covers it. `tag_tracker.py` and `make_tag_sheets.py` only read videos and write files, and [Measure the walk with AprilTags](#measure-the-walk-with-apriltags) covers them.
+**Don't run other scripts yet.** Unitree's examples can move the robot as soon as you give them a network interface. `stand_test.py` only works with the simulator, so it can't reach the robot. `run_policy.py` only reaches the robot if you pass `--robot`, and [Run a policy](#run-a-policy) covers when to do that. `check_lidar.py`, `lidar_map.py` and `push_box_map.py` are also read-only, and [Check the lidar](#check-the-lidar) covers them. So is `check_odom.py`, which [Check the odometry](#check-the-odometry) covers. `phone_camera.py` never talks to the robot, and [Film with a phone](#film-with-a-phone) covers it. `tag_tracker.py` and `make_tag_sheets.py` only read videos and write files, and [Measure the walk with AprilTags](#measure-the-walk-with-apriltags) covers them.
 
 ## 1. Install
 
@@ -151,6 +151,34 @@ python go2/lidar_map.py "$IFACE" --save lidar_map.png
 - **Robot:** the red dot is the base, and the arrow points to the middle beam. Beam `0` should be on the robot's left.
 - **Terminal:** it prints the most repeated values in the first map. A value repeated across many cells is probably the marker for unknown cells. If that marker is smaller than 100 m, the script draws it as a real height.
 
+### See push_box_turn's crate beams
+
+`push_box_map.py` is `lidar_map.py` for the `push_box_turn` task. Instead of the seven terrain beams it draws that task's seven crate beams. It's also read-only.
+
+**This hasn't been tried on a real robot.** It has only run against the simulated lidar.
+
+```bash
+python go2/push_box_map.py "$IFACE"
+python go2/push_box_map.py "$IFACE" --save crate.png
+```
+
+In S-M-ICRL each beam is a 10° fan of 5 near-level rays, with fans at bearings +30° to −30° (beam `0` on the left). Each ray starts 0.10 m above the base and drops just enough to meet open floor 10 m out. A beam reads `1 - d/4` for the nearest hit `d` in its fan, or 0 if nothing is within 4 m, and `object_dist` is the nearest hit over all the beams. This script marches each ray across the height map, and a ray hits the first cell that is higher than it. It uses S-M-ICRL's crate (0.45 m tall, 0.60 m wide), which sits 2 m from the robot when an episode starts. With the crate dead ahead, beams 2-4 should read about 0.56 and `object_dist` about 1.78 m.
+
+- **Picture:** blue rays hit something and end at the hit. Grey rays saw nothing within 4 m. The labels at the ends give each beam's reading.
+- **Terminal:** about once a second it prints `env[0:7]`, `object_dist` and `known %`, which is the share of each beam's worst ray that crossed known cells before its hit (or its whole 4 m if it didn't hit). Unknown cells count as empty, so a beam with a low `known %` may be missing the crate rather than seeing open floor. Use `tee` to keep a record.
+- **Floor:** the ray heights come from the base's height above the floor. The script takes the floor as the median of known cells within 1 m of the base and prints the result. If that looks wrong, pass `--base-height` (in m).
+- **Robot's own body:** if the map shows the robot itself, the beams will read close to 1 with nothing in front. `--skip 0.35` ignores the first 0.35 m of every ray.
+- **Map size:** the beams reach 4 m, so a map smaller than that cuts them short. Beyond its edge they read as empty, and `known %` drops.
+
+Runs to do, with the robot standing still and the crate (or a box of about the same size) 2 m away:
+
+1. **Crate dead ahead.** Beams 2-4 should light, about 0.56.
+2. **Crate 30° left, then 30° right.** Beams 0-1, then 5-6. If the wrong side lights, left and right are swapped.
+3. **Nothing in front.** Every beam should read 0. A low box (10 cm) shouldn't light anything, because the rays pass above it.
+4. **Move the crate in.** At 1 m (face 0.775 m from the base) the lit beams should read about 0.8.
+
+Each hit is only placed to within a map cell, so a fan that only grazes the edge of the crate can light here when it wouldn't in S-M-ICRL. In the simulator, with the crate 15° left, beam 0 reads 0.54 here and 0 in S-M-ICRL, because the crate's corner is 0.4° inside that fan's outer ray.
+
 ### Try it in the simulator
 
 To see what the report looks like without a robot, `sim_headless.py --lidar` publishes simulated lidar topics. `--box` adds the box from run 2 above. Run each command in its own terminal:
@@ -161,13 +189,23 @@ python go2/stand_test.py --hold 15
 python go2/check_lidar.py lo --domain 1 --seconds 5
 ```
 
+For `push_box_map.py`, use `--crate DEG` instead of `--box`. It puts a fixed crate 2 m away at that bearing (+ is left):
+
+```bash
+python go2/sim_headless.py --flat --lidar --crate 15
+python go2/stand_test.py --hold 15
+python go2/push_box_map.py lo --domain 1
+```
+
 Start the check about 3 s after `stand_test.py`, once the robot is standing. Without `stand_test.py` the robot lies on the floor, so the heights are smaller, but the differences stay the same.
 
-**A PASS here says nothing about the real robot.** The simulated data has no noise, and its frames, scan pattern and lidar mount are assumptions. `rt/sportmodestate` always publishes in the simulator, so ignore the sport mode line too. The simulated lidar also slows the simulator by about 7%, so leave it off when testing policies.
+**A PASS here says nothing about the real robot.** The simulated data has no noise, and its frames, scan pattern and lidar mount are assumptions. `rt/sportmodestate` always publishes in the simulator, so ignore the sport mode line too. The simulated lidar also slows the simulator by about 25%, so leave it off when testing policies.
 
 ## Run a policy
 
 `run_policy.py` runs a policy from S-M-ICRL. It uses the simulator unless you pass `--robot`.
+
+It takes all three of S-M-ICRL's policy forms: a file that ends with `robot.simulate_rollout(policy)`, and the classifier forms `robot.simulate_classifier(matrices, selector)` (the selector picks one matrix each call) and `robot.simulate_weighted(matrices, weigher)` (the weigher blends them). The classifier forms are checked and run as S-M-ICRL runs them, and everything below applies to them the same way. A weigher that uses random numbers is refused, like any policy that isn't repeatable.
 
 `policies/walk_tmnxt_iter17.py` is an unchanged copy of `iter_17/code.py` from the run `walk_2026-10-27_17-37-32_TMNXT`. The script's default rate and gains (5 Hz, kp 80, kd 4) come from that run. Keep them for this policy, because the rate sets its gait and lower gains make it walk much less far. A policy from another run needs the values from that run's `config.json`.
 
@@ -192,6 +230,14 @@ python go2/run_policy.py go2/policies/walk_tmnxt_iter17.py --seconds 10
 Terminal 2 should end with `Result: finished`, and `base_x` in terminal 1 should reach about 6-7 m.
 
 If a calf speed fault stops the walk, check two things. The simulator needs `--dt 0.002`, because at its default 5 ms the calves oscillate. It also has to keep up with real time, so don't run other heavy jobs alongside it.
+
+To watch it, add `--viewer` to terminal 1's command. A window follows the robot, and closing it stops the simulator. `--odom` publishes the simulator's true base pose as `rt/utlidar/robot_odom` at 50 Hz, so `run_policy.py`'s log records where the robot went. It's much cheaper than `--lidar`, which also publishes it but at 10 Hz and slowed by its raycasts.
+
+**The window hasn't been opened on this computer yet**, because there was no display to test it on. Without a working GPU driver it's drawn in software, at roughly 20 frames/s with shadows and reflections off (as it starts) and about 5 frames/s with them on. It's held to 2 CPU threads, so that it can't take time from `run_policy.py`.
+
+A slow simulator is the main thing to watch for. `run_policy.py` keeps to real time, so if the simulator falls behind, the policy acts too often for the physics and every motion goes wrong. With `apt` and `conda` installs running, the simulator here ran at about 35% of real time, and `walk_tmnxt_iter17.py` went 0.15 m in 10 s instead of 6-7 m. Every second, terminal 1 prints the simulated time `t`. It should go up by about 1 each time.
+
+S-M-ICRL's real-robot loop can run each policy here first, in the window, for you to approve before the robot (`real_robot.preview`, see its `real_robot.md`). It starts the simulator itself, with `--viewer --flat --dt 0.002 --odom`, and warns when it ran below 90% of real time.
 
 ### Test on the robot
 
@@ -323,7 +369,7 @@ python go2/run_policy.py go2/policies/walk_tmnxt_iter17.py --seconds 8
 
 S-M-ICRL's real-robot loop can show the LLM pictures of each run, filmed by a phone. `phone_camera.py` reads the phone's video stream over the network. It never talks to the robot.
 
-**This hasn't been tried with a real phone.** It has only read a fake stream on this computer. The app names and addresses below are from the apps' own docs, so trust what the app shows over them.
+**This has only been tried with DroidCam on one phone, over campus Wi-Fi, without the robot.** The stream passed `check` at 1280x720 and 25 frames/s, and `record` kept up for 75 s with no reconnects. IP Webcam's address below is from its docs, so trust what the app shows over it.
 
 ### 1. Stream from the phone
 
@@ -363,7 +409,7 @@ It reads the stream for 5 s and saves a frame as `camera_check.jpg`. Open the fr
 
 | Message | What to try |
 |---|---|
-| `can't open ...` | Open the address in a browser on this computer. If the browser shows video, the address is fine. If it doesn't, check the address and that the app is streaming. If both are right, the network is keeping the devices apart, so see step 2. |
+| `can't open ...`, or `Connection refused` | DroidCam stops serving when the phone sleeps or the app leaves the screen: wake it, bring the app to the front, and turn its screen timeout off. DroidCam also serves one viewer at a time, so close its PC client and any browser tab showing the stream. Otherwise, open the address in a browser on this computer. If the browser shows video, the address is fine. If it doesn't, check the address and that the app is streaming. If both are right, the network is keeping the devices apart, so see step 2. |
 | `opened but sent no frames` | Close any other viewer, such as a browser tab, because some apps serve one viewer at a time. |
 | `... frames/s is below 10` or `a ... s gap between frames` | Lower the app's resolution or quality, or move the phone or the computer closer to the Wi-Fi access point. |
 
@@ -388,7 +434,9 @@ S-M-ICRL's `real_robot.md` explains what the loop does with the pictures.
 
 Once `run_policy.py` releases sport mode, the robot reports no position: [Check the odometry](#check-the-odometry) found that `rt/utlidar/robot_odom`, `rt/utlidar/robot_pose` and `rt/sportmodestate` all stop. `tag_tracker.py` measures the walk from outside instead. The phone from [Film with a phone](#film-with-a-phone) films a tag on the robot's back and a tag on the floor, and the script works out where the robot tag was relative to the floor tag in each frame. It never talks to the robot.
 
-**This hasn't been tried with a real camera or robot.** It has only tracked synthetic videos, rendered from the printed sheets with a known path and lens distortion. There, a 1.8 m walk measured 1.77-1.78 m, the sideways drift came within 4 cm and the turn within 1.5 deg, and calibration recovered the focal length to 0.4%.
+**This hasn't been tried on the robot.** With a real phone (DroidCam, 960x540 recordings), calibration passed at 0.22 px, and a tag slid by hand about 1 m along the floor measured 0.95 m, with no sideways drift, from 1.6-3 m away. Once still, it held within ±4 mm forward and ±1 cm sideways. On synthetic videos, rendered from the printed sheets with a known path and lens distortion, a 1.8 m walk measured 1.77-1.78 m, the sideways drift came within 4 cm and the turn within 1.5 deg, and calibration recovered the focal length to 0.4%.
+
+S-M-ICRL's real-robot loop can score its walks from this, with `position_source: tags` (see its `real_robot.md`). It runs `track` on each run's recording itself.
 
 ### 1. Print the sheets
 
@@ -442,6 +490,6 @@ The frame times are when frames arrived, so they lag the robot by the stream's d
 |---|---|
 | `the floor tag (ID 1) was never seen` | Check that it's in the picture, that it was printed at 100%, and that its white border wasn't cut off. Move the phone closer. |
 | `the floor tag was over 3 px from where it usually is` | The phone moved, the floor tag was moved, or the robot walked over it. Fix whichever it was, and record again. |
-| `the robot tag was seen in only ...` | More light, lock focus, bring the phone closer or higher, and check that the tag lies flat. |
+| `the robot tag was seen in only ...` | More light, lock focus, bring the phone closer or higher, and check that the tag lies flat. Keep the lane out of the app's watermark: DroidCam's free version writes `using droidcam.app` across the picture, and a tag under it isn't found. |
 | `... is for WxH pictures, but the video is ...` | The calibration was made at a different resolution. Calibrate again with the same settings. |
 | `the video doesn't cover the walk` | Start the recording before `run_policy.py`, on the same computer. |

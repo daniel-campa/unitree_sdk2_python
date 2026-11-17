@@ -18,7 +18,9 @@ The log also keeps rt/utlidar/robot_odom, the robot's position estimate, when it
 publishes. Nothing here acts on it; S-M-ICRL scores walking with it.
 
 POLICY.py is S-M-ICRL code that defines policy(robot_state) and ends with
-robot.simulate_rollout(policy). The defaults for --policy-hz, --kp and --kd come
+robot.simulate_rollout(policy), or a classifier that ends with
+robot.simulate_classifier(matrices, selector) or
+robot.simulate_weighted(matrices, weigher). The defaults for --policy-hz, --kp and --kd come
 from the run that produced go2/policies/walk_tmnxt_iter17.py. Other policies need
 the values from their own run's config.json.
 
@@ -122,6 +124,11 @@ POLICY_BUILTINS = {
                  "tuple", "dict", "float", "int", "bool", "str", "print", "hasattr", "getattr",
                  "isinstance", "sorted", "any", "all")
 }
+# simulate_weighted's limits, also from S-M-ICRL. Redrawing only helps a random
+# weigher, and check_policy refuses those.
+WEIGHT_REDRAW_LIMIT = 3
+WEIGHT_SUM_TOL = 1e-6
+WEIGHT_NEG_TOL = 1e-9
 
 
 class Refused(Exception):
@@ -268,13 +275,89 @@ def _policy_import(name, globals=None, locals=None, fromlist=(), level=0):
     return builtins.__import__(name, globals, locals, fromlist, level)
 
 
+def _policy_matrices(kind, matrices, same_shape):
+    """Check a classifier's matrices as S-M-ICRL does and return them as arrays."""
+    mats = []
+    for i, m in enumerate(matrices):
+        arr = np.asarray(m, dtype=float)
+        if arr.ndim != 2 or arr.shape[0] != len(JOINTS):
+            raise ValueError(f"{kind}: matrix {i} must have shape ({len(JOINTS)}, env_dim); "
+                             f"got {arr.shape}")
+        if same_shape and mats and arr.shape != mats[0].shape:
+            raise ValueError(f"{kind}: matrix {i} has shape {arr.shape} but matrix 0 has "
+                             f"{mats[0].shape}; all must match to be blended")
+        if not np.isfinite(arr).all():
+            raise ValueError(f"{kind}: matrix {i} contains non-finite values")
+        mats.append(arr)
+    if not mats:
+        raise ValueError(f"{kind}: matrices is empty")
+    return mats
+
+
+def _check_weights(raw, n):
+    """S-M-ICRL's check of one weigher output. Returns (weights, None) or (None, problem)."""
+    try:
+        w = np.asarray(raw, dtype=float).reshape(-1)
+    except (TypeError, ValueError):
+        return None, f"{raw!r:.80} is not a numeric vector"
+    if w.shape[0] != n:
+        return None, f"got {w.shape[0]} weights for {n} matrices"
+    if not np.isfinite(w).all():
+        return None, f"non-finite weights {np.round(w, 4).tolist()}"
+    if (w < -WEIGHT_NEG_TOL).any():
+        return None, f"negative weights {np.round(w, 4).tolist()}; all must be >= 0"
+    w = np.clip(w, 0.0, None)
+    if abs(w.sum() - 1.0) > WEIGHT_SUM_TOL:
+        return None, f"weights {np.round(w, 4).tolist()} sum to {w.sum():.6f}; they must sum to 1"
+    return w / w.sum(), None
+
+
 class _PolicyCatcher:
-    """Stands in for S-M-ICRL's `robot`, which the policy file hands its policy to."""
+    """Stands in for S-M-ICRL's `robot`, which the policy file hands its policy to.
+
+    simulate_classifier and simulate_weighted wrap their selector or weigher into
+    a plain policy, the same way S-M-ICRL's robot_api.py does before it calls
+    simulate_rollout.
+    """
 
     def __init__(self):
         self.policy = None
 
-    def simulate_rollout(self, policy):
+    def simulate_rollout(self, policy, target_rpy=None):
+        self.policy = policy
+
+    def simulate_classifier(self, matrices, selector, target_rpy=None):
+        mats = _policy_matrices("simulate_classifier", matrices, same_shape=False)
+        if not callable(selector):
+            raise ValueError("simulate_classifier: selector must be a callable robot_state -> int")
+        n = len(mats)
+
+        def policy(robot_state):
+            raw = selector(robot_state)
+            try:
+                idx = int(raw)
+            except (TypeError, ValueError):
+                raise RuntimeError(f"selector returned {raw!r}; expected an int index in 0..{n - 1}")
+            if not 0 <= idx < n:
+                raise RuntimeError(f"selector returned index {idx}; valid range is 0..{n - 1}")
+            return mats[idx]
+
+        self.policy = policy
+
+    def simulate_weighted(self, matrices, weigher, target_rpy=None):
+        mats = _policy_matrices("simulate_weighted", matrices, same_shape=True)
+        if not callable(weigher):
+            raise ValueError("simulate_weighted: weigher must be a callable robot_state -> weights")
+        stack = np.stack(mats)
+
+        def policy(robot_state):
+            for _ in range(WEIGHT_REDRAW_LIMIT + 1):
+                w, problem = _check_weights(weigher(robot_state), len(mats))
+                if problem is None:
+                    return np.tensordot(w, stack, axes=1)
+            raise RuntimeError(f"weigher returned invalid weights on {WEIGHT_REDRAW_LIMIT + 1} "
+                               f"draws in a row; last: {problem}")
+
         self.policy = policy
 
 
@@ -288,7 +371,8 @@ def load_policy(path):
     }
     exec(compile(Path(path).read_text(), str(path), "exec"), namespace)
     if not callable(catcher.policy):
-        raise ValueError("the file did not call robot.simulate_rollout(policy)")
+        raise ValueError("the file did not call robot.simulate_rollout, "
+                         "robot.simulate_classifier or robot.simulate_weighted")
     return catcher.policy
 
 

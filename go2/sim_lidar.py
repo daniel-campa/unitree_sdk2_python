@@ -7,7 +7,9 @@ view limit or packet loss. A passing check here says nothing about the real robo
 
 One ray is cast from the lidar's position to each point of a floor grid around the
 robot. The rays stop at the first thing they hit, so the floor behind a raised
-surface is hidden from them, as it can be from a real lidar.
+surface is hidden from them, as it can be from a real lidar. A ring of level and
+upward rays is also cast, so that the sides of things taller than the lidar show up
+(the floor grid alone only reaches the part of an object below the lidar).
 """
 import mujoco
 import numpy as np
@@ -30,6 +32,9 @@ GRID_CELLS = 81  # per side, so the grid reaches 2 m from the robot
 MOUNT = np.array([0.28, 0.0, 0.1])  # lidar position in the base frame; a guess, because it's undocumented
 UNKNOWN = float("nan")  # height map value for cells that no ray reached
 POINT_FLOAT32 = 7  # sensor_msgs PointField FLOAT32
+# Extra rays, in the lidar's frame, for objects taller than the lidar.
+RING_AZIMUTHS = np.radians(np.arange(0.0, 360.0, 2.0))
+RING_ELEVATIONS = np.radians(np.arange(-30.0, 46.0, 3.0))
 WORLD_GEOMS_ONLY = np.array([1, 0, 0, 0, 0, 0], dtype=np.uint8)  # the robot's geoms are in groups 2 and 3
 
 
@@ -47,7 +52,11 @@ class SimLidar:
 
         offsets = np.arange(GRID_CELLS) * RESOLUTION
         self._grid_x, self._grid_y = np.meshgrid(offsets, offsets)  # indexed [iy, ix]
-        rays = GRID_CELLS * GRID_CELLS
+        azimuth, elevation = np.meshgrid(RING_AZIMUTHS, RING_ELEVATIONS)
+        self._ring = np.column_stack((np.cos(elevation.ravel()) * np.cos(azimuth.ravel()),
+                                      np.cos(elevation.ravel()) * np.sin(azimuth.ravel()),
+                                      np.sin(elevation.ravel())))
+        rays = GRID_CELLS * GRID_CELLS + len(self._ring)
         self._directions = np.zeros(rays * 3)
         self._geoms = np.zeros(rays, dtype=np.int32)
         self._distances = np.zeros(rays)
@@ -80,10 +89,14 @@ class SimLidar:
         lidar += self._data.qpos[:3]
 
         directions = self._directions.reshape(-1, 3)
-        directions[:, 0] = origin[0] + self._grid_x.ravel() - lidar[0]
-        directions[:, 1] = origin[1] + self._grid_y.ravel() - lidar[1]
-        directions[:, 2] = -lidar[2]
-        directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+        grid = directions[: GRID_CELLS * GRID_CELLS]
+        grid[:, 0] = origin[0] + self._grid_x.ravel() - lidar[0]
+        grid[:, 1] = origin[1] + self._grid_y.ravel() - lidar[1]
+        grid[:, 2] = -lidar[2]
+        grid /= np.linalg.norm(grid, axis=1, keepdims=True)
+        rotation = np.zeros(9)
+        mujoco.mju_quat2Mat(rotation, self._data.qpos[3:7])
+        directions[GRID_CELLS * GRID_CELLS:] = self._ring @ rotation.reshape(3, 3).T
 
         mujoco.mj_multiRay(self._model, self._data, lidar, self._directions, WORLD_GEOMS_ONLY, True, -1,
                            self._geoms, self._distances, None, len(self._geoms), mujoco.mjMAXVAL)
@@ -136,3 +149,29 @@ class SimLidar:
         msg.origin = [float(origin[0]), float(origin[1])]
         msg.data = heights.tolist()
         return msg
+
+
+ODOM_ONLY_RATE = 50.0  # Hz
+
+
+class SimOdom:
+    """Publish only rt/utlidar/robot_odom, the simulator's true base pose, for go2/sim_headless.py --odom.
+
+    No rays are cast, so unlike SimLidar it hardly slows the simulation. It's for
+    scoring a run in the simulator from run_policy.py's log, not for check_lidar.py.
+    """
+
+    def __init__(self, model, data):
+        self._data = data
+        self._next_publish = 0.0
+        self._odom = ChannelPublisher("rt/utlidar/robot_odom", Odometry_)
+        self._odom.Init()
+
+    def step(self):
+        """Publish if it's time to. Call from the thread that steps the physics."""
+        if self._data.time < self._next_publish:
+            return
+        self._next_publish = self._data.time + 1.0 / ODOM_ONLY_RATE
+        self._odom.Write(SimLidar._odom_message(self, self._data.time))
+
+    _header = SimLidar._header
