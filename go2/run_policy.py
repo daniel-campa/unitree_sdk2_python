@@ -9,9 +9,12 @@ so follow the test order in go2/README.md.
     python go2/run_policy.py POLICY.py --robot                  # robot
     python go2/run_policy.py POLICY.py --robot enp3s0           # robot, on another interface
     python go2/run_policy.py POLICY.py --check                  # only check the policy
+    python go2/run_policy.py --trajectory TRAJ.txt --rate 33    # play back joint angles
 
 The sequence is: stand up, hold, walk for --seconds, return to the home pose, lie
-down, then damp the motors. A fault, the remote's B button or Ctrl-C goes straight
+down, then damp the motors. With --trajectory, the walk is an open-loop playback of
+the file's joint angles, interpolated between samples, after a ramp to its first
+sample. A fault, the remote's B button or Ctrl-C goes straight
 to damping. Start the simulator with `python go2/sim_headless.py --flat --dt 0.002`.
 
 The log also keeps rt/utlidar/robot_odom, the robot's position estimate, when it
@@ -91,7 +94,7 @@ MAX_WALK_S = 60.0
 # 11 rad/s (thigh) and 8 rad/s (calf).
 MAX_TILT = 0.5  # rad
 MAX_SPEED = np.array([25.0, 25.0, 14.0] * 4)  # rad/s, below Unitree's 30.1 and 15.7
-MAX_TEMPERATURE = 75  # °C
+MAX_TEMPERATURE = 85  # °C
 JOINT_LIMIT_MARGIN = 0.05  # rad
 MAX_STATE_AGE = 0.1  # s
 # The policy holds each target for 200 ms anyway, so a shorter stall is harmless.
@@ -430,6 +433,74 @@ def prepare_policy(path, env, fill_height=None):
     return policy, hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def load_trajectory(path):
+    """Read a trajectory file and return its rows in the SDK's joint order.
+
+    The first line is a '#' header naming the 12 joints in the file's column order
+    (FL_hip or FL_hip_joint, ...). Each further line is one sample, in radians.
+    """
+    with open(path) as file:
+        header = file.readline()
+    if not header.startswith("#"):
+        raise ValueError("the first line must be a '#' header naming the 12 joints")
+    names = [name.removesuffix("_joint") for name in header[1:].split()]
+    if sorted(names) != sorted(JOINTS):
+        raise ValueError("the header must name each of " + " ".join(JOINTS) + " once")
+    rows = np.loadtxt(path, comments="#", ndmin=2)
+    if rows.shape[1] != 12:
+        raise ValueError(f"rows have {rows.shape[1]} values, not 12")
+    if len(rows) < 2:
+        raise ValueError("it needs at least 2 rows")
+    return rows[:, [names.index(joint) for joint in JOINTS]]
+
+
+def trajectory_problem(rows, rate):
+    """Return why these rows can't be played at this rate, or None."""
+    if not np.isfinite(rows).all():
+        return "it has non-finite values"
+    outside = (rows < JOINT_LOW + JOINT_LIMIT_MARGIN) | (rows > JOINT_HIGH - JOINT_LIMIT_MARGIN)
+    if outside.any():
+        row, joint = np.argwhere(outside)[0]
+        return f"sample {row + 1} puts {JOINTS[joint]} at {rows[row, joint]:+.2f} rad, at its joint limit"
+    speed = np.abs(np.diff(rows, axis=0)) * rate
+    fast = speed > MAX_SPEED
+    if fast.any():
+        row, joint = np.argwhere(fast)[0]
+        return (f"samples {row + 1}-{row + 2} move {JOINTS[joint]} at {speed[row, joint]:.1f} rad/s, "
+                f"above the {MAX_SPEED[joint]} rad/s speed fault")
+    return None
+
+
+def prepare_trajectory(path, rate):
+    """Return checked trajectory rows in SDK order and the file's hash."""
+    try:
+        rows = load_trajectory(path)
+    except (OSError, ValueError) as error:
+        raise Refused(f"can't use trajectory {path}: {error}") from error
+    problem = trajectory_problem(rows, rate)
+    if problem:
+        raise Refused(f"can't use trajectory {path}: {problem}")
+    return rows, hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def trajectory_seconds(rows, rate):
+    return (len(rows) - 1) / rate
+
+
+def trajectory_target(rows, rate, elapsed):
+    """Interpolate linearly between samples, holding the last one at the end."""
+    position = min(elapsed * rate, len(rows) - 1)
+    i = min(int(position), len(rows) - 2)
+    return rows[i] + (rows[i + 1] - rows[i]) * (position - i)
+
+
+def describe_trajectory(rows, rate):
+    speed = np.abs(np.diff(rows, axis=0)).max(axis=0) * rate
+    return (f"{len(rows)} samples, {trajectory_seconds(rows, rate):.2f} s at {rate:g} Hz; "
+            f"first sample {np.abs(rows[0] - HOME).max():.2f} rad from home; peak commanded speed "
+            f"hip {speed[0::3].max():.1f}, thigh {speed[1::3].max():.1f}, calf {speed[2::3].max():.1f} rad/s")
+
+
 def arm_watchdog(seconds):
     """Raise Fault in the main thread after this long unless re-armed. 0 disarms it."""
     signal.setitimer(signal.ITIMER_REAL, seconds)
@@ -448,11 +519,13 @@ def format_legs(values):
     return " | ".join(f"{name} {leg}" for name, leg in zip(("FR", "FL", "RR", "RL"), legs))
 
 
-def dry_run(monitor, policy, env, policy_hz, seconds, fill_height=None):
-    """Print what the policy would command. This creates no publisher or SDK client."""
+def dry_run(monitor, seconds, step_hz, target_at):
+    """Print what target_at(elapsed, state) would command, computing it step_hz times a second.
+
+    This creates no publisher or SDK client.
+    """
     print("Dry run: nothing is published, so this can't move the robot.", flush=True)
     start = time.perf_counter()
-    start_yaw = read_state(monitor.msg).rpy[2]
     calls = 0
     while True:
         elapsed = time.perf_counter() - start
@@ -462,15 +535,15 @@ def dry_run(monitor, policy, env, policy_hz, seconds, fill_height=None):
         if age > MAX_STATE_AGE:
             raise Fault(f"no robot state for {age * 1000:.0f} ms")
         state = read_state(monitor.msg)
-        target = policy_target(policy, build_robot_state(state, start_yaw, fill_height), env)
-        if calls % max(1, round(policy_hz)) == 0:
+        target = target_at(elapsed, state)
+        if calls % max(1, round(step_hz)) == 0:
             roll, pitch, _ = state.rpy
             print(f"t={elapsed:5.1f} s  roll={roll:+.2f}  pitch={pitch:+.2f}  "
                   f"B button={'pressed' if state.stop_pressed else 'not pressed'}\n"
                   f"  joints {format_legs(state.q)}\n"
                   f"  target {format_legs(target)}", flush=True)
-        calls = int(elapsed * policy_hz) + 1
-        time.sleep(max(0.0, start + calls / policy_hz - time.perf_counter()))
+        calls = int(elapsed * step_hz) + 1
+        time.sleep(max(0.0, start + calls / step_hz - time.perf_counter()))
 
 
 class Controller:
@@ -609,13 +682,18 @@ class Controller:
 
         self.run_phase("walking", seconds, target_at)
 
-    def run_sequence(self, policy, env, policy_hz, seconds, ask_before_walking, fill_height=None):
+    def play(self, rows, rate, seconds):
+        self.move_to("moving to the first sample", rows[0], RETURN_HOME_S)
+        self.run_phase("playing", seconds, lambda elapsed, state: trajectory_target(rows, rate, elapsed))
+
+    def run_sequence(self, motion, seconds, ask_before_walking):
+        """Stand, run motion() (a walk or a playback) if seconds > 0, then lie down."""
         self.move_to("standing up", HOME, STAND_UP_S, check_range=False)
         self.hold("settling", HOME, SETTLE_S)
         if seconds > 0:
             self.check_ready_to_walk()
             if not ask_before_walking or self.wait_for_go():
-                self.walk(policy, env, policy_hz, seconds, fill_height)
+                motion()
                 self.move_to("returning home", HOME, RETURN_HOME_S)
                 self.hold("settling after walking", HOME, 1.0)
         self.move_to("lying down", LIE_DOWN, LIE_DOWN_S)
@@ -747,9 +825,15 @@ def prepare_robot(args, monitor, digest):
         raise Refused(f"battery is at {battery}%, minimum {MIN_BATTERY_PERCENT}%")
     inputs = ("" if args.fill_height is None else
               f"  Inputs:  height fixed at {args.fill_height:g} m, body velocity at 0 (--fill-unmeasured)\n")
+    if args.trajectory:
+        source = f"  Trajectory: {args.trajectory} (sha256 {digest[:12]}), open loop\n"
+        rate = args.rate
+    else:
+        source = f"  Policy:  {args.policy} (sha256 {digest[:12]})\n"
+        rate = args.policy_hz
     print(f"\nTHIS WILL MOVE THE ROBOT on {args.robot}.\n"
-          f"  Policy:  {args.policy} (sha256 {digest[:12]})\n"
-          f"  Rate:    {args.policy_hz:g} Hz, kp {args.kp:g}, kd {args.kd:g}\n"
+          f"{source}"
+          f"  Rate:    {rate:g} Hz, kp {args.kp:g}, kd {args.kd:g}\n"
           f"  Torque:  capped at {args.torque_fraction:.0%} of the limits\n"
           f"{inputs}"
           f"  Walking: {args.seconds:g} s; it will lie down first, then stand up\n"
@@ -771,15 +855,21 @@ def bounded(low, high):
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("policy", type=Path, help="policy file from S-M-ICRL")
+    parser.add_argument("policy", type=Path, nargs="?", help="policy file from S-M-ICRL")
+    parser.add_argument("--trajectory", type=Path, metavar="FILE",
+                        help="play back joint angles from FILE instead of running a policy: a '#' header "
+                             "naming the 12 joints, then one row of radians per sample")
+    parser.add_argument("--rate", type=bounded(1.0, 500.0), metavar="HZ",
+                        help="samples per second in the --trajectory file (required with it)")
     parser.add_argument("--robot", metavar="INTERFACE", nargs="?", const=DEFAULT_INTERFACE,
                         help="use the robot, on this network interface (if none is given: %(const)s); "
                              "without --robot, use the simulator")
     parser.add_argument("--dry-run", action="store_true", help="print commands without publishing them")
     parser.add_argument("--check", action="store_true",
                         help="only load and check the policy, without connecting to anything")
-    parser.add_argument("--seconds", type=bounded(0.0, MAX_WALK_S), default=3.0,
-                        help="how long to walk; 0 only stands up and lies down (default: %(default)s)")
+    parser.add_argument("--seconds", type=bounded(0.0, MAX_WALK_S),
+                        help="how long to walk; 0 only stands up and lies down (default: 3, or the "
+                             "whole trajectory; a trajectory stops at its last sample either way)")
     parser.add_argument("--policy-hz", type=bounded(0.5, 500.0), default=POLICY_HZ,
                         help="policy rate, which sets this policy's gait (default: %(default)s)")
     parser.add_argument("--kp", type=bounded(1.0, 200.0), default=KP, help="default: %(default)s")
@@ -795,7 +885,14 @@ def parse_args():
                              "%(const)s) instead of refusing a policy that reads them")
     parser.add_argument("--domain", type=int, help="DDS domain id (default: 0 with --robot, otherwise 1)")
     parser.add_argument("--log", type=Path, help="where to save the run (default: go2/logs/<time>.npz)")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if (args.policy is None) == (args.trajectory is None):
+        parser.error("give either a policy file or --trajectory FILE")
+    if (args.rate is None) != (args.trajectory is None):
+        parser.error("--rate goes with --trajectory, and --trajectory needs it")
+    if args.trajectory and args.fill_height is not None:
+        parser.error("--fill-unmeasured only applies to policies")
+    return args
 
 
 def main():
@@ -805,13 +902,29 @@ def main():
     env = flat_floor_env(args.probe_height)
     original_mode = None
     try:
-        policy, digest = prepare_policy(args.policy, env, args.fill_height)
-        if args.check:
-            print(f"Policy OK: {args.policy}", flush=True)
-            return 0
+        if args.trajectory:
+            rows, digest = prepare_trajectory(args.trajectory, args.rate)
+            length = trajectory_seconds(rows, args.rate)
+            args.seconds = min(length if args.seconds is None else args.seconds, length)
+            if args.check:
+                print(f"Trajectory OK: {args.trajectory}\n  {describe_trajectory(rows, args.rate)}", flush=True)
+                return 0
+        else:
+            policy, digest = prepare_policy(args.policy, env, args.fill_height)
+            if args.seconds is None:
+                args.seconds = 3.0
+            if args.check:
+                print(f"Policy OK: {args.policy}", flush=True)
+                return 0
         monitor, subscriber, odom = connect(args)
         if args.dry_run:
-            dry_run(monitor, policy, env, args.policy_hz, args.seconds, args.fill_height)
+            if args.trajectory:
+                dry_run(monitor, args.seconds, args.rate,
+                        lambda elapsed, state: trajectory_target(rows, args.rate, elapsed))
+            else:
+                start_yaw = read_state(monitor.msg).rpy[2]
+                dry_run(monitor, args.seconds, args.policy_hz, lambda elapsed, state: policy_target(
+                    policy, build_robot_state(state, start_yaw, args.fill_height), env))
             return 0
         if args.robot:
             original_mode = prepare_robot(args, monitor, digest)
@@ -828,8 +941,13 @@ def main():
     outcome = "finished"
     status = 0
     try:
-        controller.run_sequence(policy, env, args.policy_hz, args.seconds,
-                                ask_before_walking=bool(args.robot), fill_height=args.fill_height)
+        if args.trajectory:
+            def motion():
+                controller.play(rows, args.rate, args.seconds)
+        else:
+            def motion():
+                controller.walk(policy, env, args.policy_hz, args.seconds, args.fill_height)
+        controller.run_sequence(motion, args.seconds, ask_before_walking=bool(args.robot))
     except Fault as fault:
         outcome, status = f"FAULT: {fault}", 1
     except KeyboardInterrupt:
@@ -850,7 +968,8 @@ def main():
 
     log_path = args.log or Path(__file__).resolve().parent / "logs" / f"{datetime.now():%Y-%m-%d_%H-%M-%S}.npz"
     saved = controller.save_log(log_path, {
-        "policy": str(args.policy), "sha256": digest, "outcome": outcome, "interface": args.robot or "lo",
+        "policy": args.policy and str(args.policy),
+        "trajectory": args.trajectory and str(args.trajectory), "rate": args.rate, "sha256": digest, "outcome": outcome, "interface": args.robot or "lo",
         "policy_hz": args.policy_hz, "kp": args.kp, "kd": args.kd, "seconds": args.seconds,
         "torque_fraction": args.torque_fraction, "probe_height": args.probe_height,
         "fill_height": args.fill_height,

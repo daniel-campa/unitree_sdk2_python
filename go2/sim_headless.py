@@ -12,6 +12,7 @@ Unitree's, unmodified.
 import argparse
 import math
 import os
+import signal
 import sys
 import threading
 import time
@@ -29,7 +30,8 @@ parser.add_argument(
 parser.add_argument("--domain", type=int, default=1, help="DDS domain id")
 parser.add_argument("--duration", type=float, default=0.0, help="seconds to run; 0 = forever")
 parser.add_argument("--dt", type=float, default=0.005, help="physics timestep, seconds")
-parser.add_argument("--video", type=Path, help="record the run to this .mp4 (needs --duration or Ctrl-C to finish)")
+parser.add_argument("--video", type=Path,
+                    help="record the run to this .mp4, written when the simulator stops (--duration, Ctrl-C or SIGTERM)")
 parser.add_argument("--viewer", action="store_true",
                     help="show the simulation in a window that follows the robot; closing it stops the simulator")
 parser.add_argument("--flat", action="store_true", help="remove the scene's boxes, leaving only the floor")
@@ -91,8 +93,12 @@ data = mujoco.MjData(model)
 mujoco.mj_resetDataKeyframe(model, data, model.key("home").id)
 data.ctrl[:] = 0.0  # the keyframe's ctrl holds joint angles, but these are torque motors
 
+STATE_PERIOD = 0.005  # s, rt/lowstate and rt/sportmodestate
 ChannelFactoryInitialize(args.domain, "lo")
+# The bridge publishes state at its model's timestep. At 500 Hz its threads hog the GIL and the sim falls behind real time.
+model.opt.timestep = max(args.dt, STATE_PERIOD)
 bridge = UnitreeSdk2Bridge(model, data)
+model.opt.timestep = args.dt
 lidar = None
 if args.lidar:
     from sim_lidar import SimLidar
@@ -104,18 +110,8 @@ elif args.odom:
     lidar = SimOdom(model, data)
 
 VIDEO_FPS = 30
-renderer = writer = camera = None
-if args.video:
-    import cv2
-
-    args.video.parent.mkdir(parents=True, exist_ok=True)
-    renderer = mujoco.Renderer(model, height=480, width=640)
-    writer = cv2.VideoWriter(str(args.video), cv2.VideoWriter_fourcc(*"mp4v"), VIDEO_FPS, (640, 480))
-    camera = mujoco.MjvCamera()
-    camera.type = mujoco.mjtCamera.mjCAMERA_TRACKING
-    camera.trackbodyid = model.body("base_link").id
-    camera.distance, camera.azimuth, camera.elevation = 1.4, 135.0, -15.0
-frames_written = 0
+# Rendering while stepping would slow the sim below real time, so poses are kept and rendered at exit.
+video_poses = [] if args.video else None
 
 VIEWER_FPS = 60
 viewer = None
@@ -132,11 +128,31 @@ if args.viewer:
 viewer_synced = 0.0
 
 
-def record_frame():
-    global frames_written
-    renderer.update_scene(data, camera)
-    writer.write(renderer.render()[:, :, ::-1])  # RGB to BGR
-    frames_written += 1
+def write_video():
+    import cv2
+
+    args.video.parent.mkdir(parents=True, exist_ok=True)
+    renderer = mujoco.Renderer(model, height=480, width=640)
+    writer = cv2.VideoWriter(str(args.video), cv2.VideoWriter_fourcc(*"mp4v"), VIDEO_FPS, (640, 480))
+    camera = mujoco.MjvCamera()
+    camera.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+    camera.trackbodyid = model.body("base_link").id
+    camera.distance, camera.azimuth, camera.elevation = 1.4, 135.0, -15.0
+    frame = mujoco.MjData(model)  # the bridge's threads still read `data`
+    for qpos in video_poses:
+        frame.qpos[:] = qpos
+        mujoco.mj_kinematics(model, frame)
+        renderer.update_scene(frame, camera)
+        writer.write(renderer.render()[:, :, ::-1])  # RGB to BGR
+    writer.release()
+    print(f"video: {args.video} ({len(video_poses)} frames, {len(video_poses) / VIDEO_FPS:.1f} s)", flush=True)
+
+
+def on_sigterm(signum, frame):
+    raise KeyboardInterrupt
+
+
+signal.signal(signal.SIGTERM, on_sigterm)
 
 
 stop = threading.Event()
@@ -164,25 +180,25 @@ try:
         mujoco.mj_step(model, data)
         if lidar is not None:
             lidar.step()
-        if writer is not None and data.time * VIDEO_FPS >= frames_written:
-            record_frame()
+        if video_poses is not None and data.time * VIDEO_FPS >= len(video_poses):
+            video_poses.append(data.qpos.copy())
         if viewer is not None and step_start - viewer_synced >= 1.0 / VIEWER_FPS:
             if not viewer.is_running():
                 break
             viewer.sync()
             viewer_synced = step_start
-        remaining = model.opt.timestep - (time.perf_counter() - step_start)
-        if remaining > 0:
-            time.sleep(remaining)
+        ahead = data.time - (time.perf_counter() - start)  # against the clock, so slow steps are made up
+        if ahead > 0:
+            time.sleep(ahead)
 except KeyboardInterrupt:
     pass
 finally:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
     stop.set()
     if viewer is not None:
         viewer.close()
-    if writer is not None:
-        writer.release()
-        print(f"video: {args.video} ({frames_written} frames, {data.time:.1f} s sim time)", flush=True)
+    if video_poses is not None:
+        write_video()
 
 # Unitree's publisher threads do not stop on their own.
 os._exit(0)

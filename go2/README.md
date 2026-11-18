@@ -203,7 +203,7 @@ Start the check about 3 s after `stand_test.py`, once the robot is standing. Wit
 
 ## Run a policy
 
-`run_policy.py` runs a policy from S-M-ICRL. It uses the simulator unless you pass `--robot`.
+`run_policy.py` runs a policy from S-M-ICRL, or plays back a recorded joint trajectory ([Play back a joint trajectory](#play-back-a-joint-trajectory)). It uses the simulator unless you pass `--robot`.
 
 It takes all three of S-M-ICRL's policy forms: a file that ends with `robot.simulate_rollout(policy)`, and the classifier forms `robot.simulate_classifier(matrices, selector)` (the selector picks one matrix each call) and `robot.simulate_weighted(matrices, weigher)` (the weigher blends them). The classifier forms are checked and run as S-M-ICRL runs them, and everything below applies to them the same way. A weigher that uses random numbers is refused, like any policy that isn't repeatable.
 
@@ -231,13 +231,13 @@ Terminal 2 should end with `Result: finished`, and `base_x` in terminal 1 should
 
 If a calf speed fault stops the walk, check two things. The simulator needs `--dt 0.002`, because at its default 5 ms the calves oscillate. It also has to keep up with real time, so don't run other heavy jobs alongside it.
 
-To watch it, add `--viewer` to terminal 1's command. A window follows the robot, and closing it stops the simulator. `--odom` publishes the simulator's true base pose as `rt/utlidar/robot_odom` at 50 Hz, so `run_policy.py`'s log records where the robot went. It's much cheaper than `--lidar`, which also publishes it but at 10 Hz and slowed by its raycasts.
+To watch it, add `--viewer` to terminal 1's command. A window follows the robot, and closing it stops the simulator. Without a display, add `--video OUT.mp4` instead. The simulator keeps the robot's pose 30 times a second and renders the video when it stops (Ctrl-C, SIGTERM or `--duration`), so recording doesn't slow it down. Rendering takes a few seconds after it stops. `--odom` publishes the simulator's true base pose as `rt/utlidar/robot_odom` at 50 Hz, so `run_policy.py`'s log records where the robot went. It's much cheaper than `--lidar`, which also publishes it but at 10 Hz and slowed by its raycasts.
 
 **The window hasn't been opened on this computer yet**, because there was no display to test it on. Without a working GPU driver it's drawn in software, at roughly 20 frames/s with shadows and reflections off (as it starts) and about 5 frames/s with them on. It's held to 2 CPU threads, so that it can't take time from `run_policy.py`.
 
-A slow simulator is the main thing to watch for. `run_policy.py` keeps to real time, so if the simulator falls behind, the policy acts too often for the physics and every motion goes wrong. With `apt` and `conda` installs running, the simulator here ran at about 35% of real time, and `walk_tmnxt_iter17.py` went 0.15 m in 10 s instead of 6-7 m. Every second, terminal 1 prints the simulated time `t`. It should go up by about 1 each time.
+A slow simulator is the main thing to watch for. `run_policy.py` keeps to real time, so if the simulator falls behind, the policy acts too often for the physics and every motion goes wrong. With `apt` and `conda` installs running, the simulator here ran at about 35% of real time, and `walk_tmnxt_iter17.py` went 0.15 m in 10 s instead of 6-7 m. Every second, terminal 1 prints the simulated time `t`. It should go up by about 1 each time. To help it keep up, the simulator publishes `rt/lowstate` and `rt/sportmodestate` at 200 Hz, not the robot's 500 Hz.
 
-S-M-ICRL's real-robot loop can run each policy here first, in the window, for you to approve before the robot (`real_robot.preview`, see its `real_robot.md`). It starts the simulator itself, with `--viewer --flat --dt 0.002 --odom`, and warns when it ran below 90% of real time.
+S-M-ICRL's real-robot loop can run each policy here first, in the window, for you to approve before the robot (`real_robot.preview`, see its `real_robot.md`). It starts the simulator itself, with `--flat --dt 0.002 --odom` and either `--viewer` or, if the terminal has no display, `--video` into the iteration's folder. It warns when the simulator ran below 90% of real time.
 
 ### Test on the robot
 
@@ -298,6 +298,23 @@ What simulation shows, with velocity and height fixed:
 - **`sim_headless.py` (Unitree's model):** about 2.6 m sideways and 0.7-0.9 m forward, turning right by 0.55 rad (torque fraction 1.0) to 0.8 rad (0.8). At the default 0.6 the turn grew to 1.2 rad, and the run stopped at 13 s with a hip at its joint limit. Roll peaked at 0.47 rad in every run, close to the 0.5 rad tilt cutoff, so a tilt fault on the robot wouldn't be a surprise.
 
 On the robot, follow the same stages as [Test on the robot](#test-on-the-robot), with the crab command in place of the walk one. For stage 3, clear about 4 m to the robot's left and 2 m in front of it.
+
+### Play back a joint trajectory
+
+`--trajectory FILE --rate HZ` plays a recorded list of joint angles instead of running a policy. Give it in place of the policy file:
+
+```bash
+python go2/run_policy.py --trajectory ../S-M-ICRL/class_results/joint_trajectories.txt --rate 33 --check
+python go2/run_policy.py --trajectory ../S-M-ICRL/class_results/joint_trajectories.txt --rate 33
+```
+
+The file's first line is a `#` header naming the 12 joints in its column order, such as `#FL_hip_joint FL_thigh_joint ... RR_calf_joint`. The script reorders the columns to the SDK's FR, FL, RR, RL, so any order works as long as the header matches the columns. Each further line is one sample, in radians. `--rate` is how many samples there are per second. There's no default, because the wrong rate plays the motion too fast or too slow.
+
+The sequence is the same as for a policy: stand up and wait for Enter. Then it ramps for 1 s to the first sample, plays the samples, interpolating between them at 500 Hz, returns home and lies down. It plays the file once, and `--seconds` can cut it short. `--check` and `--dry-run` work as for a policy. `--check` also prints the length, how far the first sample is from home, and the fastest commanded joint speed. The script refuses a file with a sample at a joint limit, or a step between samples that exceeds the speed fault at that rate. The log's `target` column holds the interpolated angles.
+
+**It's open loop.** Nothing reacts to tilt, slips or pushes except the faults in [What stops a run](#what-stops-a-run). The angles are tracked through the same PD gains (`--kp`, `--kd`, default 80 and 4) and torque cap as a policy. Use gains close to those the trajectory was recorded with.
+
+In `sim_headless.py` (`--flat --dt 0.002`), `joint_trajectories.txt` (157 samples, 4.7 s at 33 Hz) ended `Result: finished`. It went about 1.0 m forward, with tilt peaking at 0.17 rad. With kp 80, the joints lagged the targets by up to 0.32 rad. **It hasn't been played on the robot yet.** Follow the stages in [Test on the robot](#test-on-the-robot), with the trajectory command in place of the walk one.
 
 ### What stops a run
 
