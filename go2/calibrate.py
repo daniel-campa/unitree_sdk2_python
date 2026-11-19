@@ -164,13 +164,10 @@ def read_identity(args):
     from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowState_
 
     ChannelFactoryInitialize(0 if args.robot else 1, args.robot or "lo")
-    got = {}
+    # No handler: a listener callback outlives this function in DDS and segfaults once Python frees it.
     sub = ChannelSubscriber("rt/lowstate", LowState_)
-    sub.Init(lambda msg: got.setdefault("msg", msg))
-    end = time.time() + 3.0
-    while "msg" not in got and time.time() < end:
-        time.sleep(0.05)
-    msg = got.get("msg")
+    sub.Init()
+    msg = sub.Read(3.0)
     if msg is None:
         return None
     return {"serial": "-".join(str(x) for x in msg.sn), "version": "-".join(str(x) for x in msg.version)}
