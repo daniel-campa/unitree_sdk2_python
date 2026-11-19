@@ -126,7 +126,7 @@ Every run uses **two tmux panes**:
   nice -n 10 python go2/watch.py --robot "$IFACE"
   ```
   Each second it prints a status line. It includes the estimated body velocity and height (`v` and `h`), and notes `no force` or `no accel` if the estimator can't use those sensors. It warns when latency is above 15 ms, when the state or commands stall, when a joint is at its torque limit, when the body tilts, and when a motor gets hot. When the run ends it prints what the run used: energy, battery, torque as a share of the limits, motor temperatures, lost packets, estimated distance, and the computer's CPU load and temperature.
-- **Pane 2, the policy.** `run_policy.py` drives the robot. It checks the calibration first, and refuses if there isn't one, if it's from another robot, or if its input check failed. Then it asks you to type `yes` and press B, lies the robot down, releases sport mode, stands up, and waits for **Enter** before walking. The body velocity and height estimate is on by default.
+- **Pane 2, the policy.** `run_policy.py` drives the robot. It checks the calibration first, and refuses if there isn't one, if it's from another robot, or if its input check failed. Then it asks you to type `yes` and press B, lies the robot down, releases sport mode, stands up, and waits for **Enter** before walking. When the run is over it switches sport mode back on (see [If something goes wrong](#if-something-goes-wrong)). The body velocity and height estimate is on by default.
 
 **Always pass `--policy-hz 10`.** The default of 5 Hz is wrong for these two policies.
 
@@ -255,4 +255,4 @@ In S-M-ICRL, with robot-like sensor noise and foot force sensors of unknown gain
 | `the newest robot state is ... ms old` fault | The state the script is reading is more than 100 ms old, measured against the robot's own clock. Either messages stopped arriving (check the cable) or the computer fell behind reading them (close other heavy programs). Keep the log and note the message. |
 | Connection problems | README "If something fails". |
 | The SSH connection dropped | SSH in again and run `tmux attach -t go2`. Everything carried on. Without tmux, the run stopped and damped, and `go2/logs/hangup.log` says when. |
-| Sport mode is gone after a run | Expected. Restart the robot to get it back. |
+| Sport mode after a run | `run_policy.py` switches it back on after a run that finishes, and the robot may move when it does. After a stop or a fault it asks first: press Enter to switch it on, or type `n` to leave it off. If it says sport mode didn't come back, use the app or restart the robot. `calibrate.py`'s hang and stand steps still leave it off. |

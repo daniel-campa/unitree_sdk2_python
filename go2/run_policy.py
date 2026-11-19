@@ -121,6 +121,9 @@ STOP_BUTTON_MASK = 1 << 1  # B, in wireless_remote[3]; see example/wireless_cont
 POS_STOP, VEL_STOP = 2.146e9, 16000.0  # values that disable a motor's control loops
 STAND_DOWN_S = 4.0
 RELEASE_ATTEMPTS = 5
+SPORT_MODE = "mcf"  # the mode this Go2 reports while sport mode is on
+RESTORE_ATTEMPTS = 3
+RESTORE_WAIT_S = 4.0
 
 LOG_FIELDS = ("t", "stage", "q", "dq", "target", "q_cmd", "tau_est", "temperature", "rpy",
               "gyro", "accel", "foot_force", "power_v", "power_a",
@@ -961,11 +964,22 @@ def confirm_stop_button(monitor):
             time.sleep(0.01)
 
 
+_switcher = None
+
+
+def motion_switcher():
+    """The one client for the robot's mode service, shared by releasing and restoring."""
+    global _switcher
+    if _switcher is None:
+        _switcher = MotionSwitcherClient()
+        _switcher.SetTimeout(5.0)
+        _switcher.Init()
+    return _switcher
+
+
 def release_sport_mode():
     """Lie the robot down and switch sport mode off. Return the mode that was active."""
-    switcher = MotionSwitcherClient()
-    switcher.SetTimeout(5.0)
-    switcher.Init()
+    switcher = motion_switcher()
     sport = SportClient()
     sport.SetTimeout(5.0)
     sport.Init()
@@ -985,6 +999,59 @@ def release_sport_mode():
         if code == 0 and not mode["name"]:
             return original
     raise Refused("sport mode didn't release")
+
+
+def select_sport_mode(name):
+    """Ask the robot for sport mode `name`. Return the mode it then reports, "" if none."""
+    switcher = motion_switcher()
+    for _ in range(RESTORE_ATTEMPTS):
+        switcher.SelectMode(name)
+        deadline = time.perf_counter() + RESTORE_WAIT_S
+        while time.perf_counter() < deadline:
+            time.sleep(0.5)
+            code, mode = switcher.CheckMode()
+            if code == 0 and mode["name"]:
+                return mode["name"]
+    return ""
+
+
+def restore_sport_mode(name, monitor, finished):
+    """Switch sport mode back on after a run, once the motors are damped and commands have stopped.
+
+    Sport mode takes over the motors, so the robot may move. After a run that finished
+    and left the robot lying level, this goes ahead. After a stop or a fault, or if the
+    robot isn't level, it asks first: whatever made the run stop may still be there.
+    Returns True if sport mode is on.
+    """
+    tilt = np.abs(read_state(monitor.msg).rpy[:2]).max()
+    if not finished or tilt > MAX_STAND_TILT:
+        why = "the run didn't finish" if not finished else f"the robot is tilted {tilt:.2f} rad"
+        signal.signal(signal.SIGINT, signal.default_int_handler)  # damping is over; Ctrl-C answers no
+        try:
+            termios.tcflush(sys.stdin, termios.TCIFLUSH)  # a key pressed during the run isn't an answer
+            print(f"Sport mode ({name}) is off, and {why}. Switching it on may move the robot.")
+            print("Press Enter to switch it on, or type n and Enter to leave it off: ", end="", flush=True)
+            answer = sys.stdin.readline()
+        except (KeyboardInterrupt, OSError, ValueError, termios.error):
+            answer = ""
+        finally:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+        if answer != "\n":  # end of input (a closed terminal) isn't a yes
+            if not answer.endswith("\n"):
+                print()
+            print("Sport mode is off. Switch it on from the app, or restart the robot.", flush=True)
+            return False
+    print(f"Switching sport mode ({name}) back on. The robot may move...", flush=True)
+    try:
+        reported = select_sport_mode(name)
+    except Exception:
+        traceback.print_exc()
+        reported = ""
+    if reported:
+        print(f"Sport mode is on ({reported}).", flush=True)
+        return True
+    print(f"Sport mode ({name}) didn't come back. Switch it on from the app, or restart the robot.", flush=True)
+    return False
 
 
 def prepare_robot(args, monitor, digest):
@@ -1085,6 +1152,12 @@ def parse_args():
     parser.add_argument("--env-hz", type=bounded(1.0, 500.0), default=ENV_HZ,
                         help="how often the env vector is rebuilt from the estimate, as S-M-ICRL's env_hz "
                              "(default: %(default)s)")
+    parser.add_argument("--sport-mode", default=SPORT_MODE, metavar="NAME",
+                        help="the sport mode to switch back to after the run, if the robot was already in "
+                             "low-level mode when the run started (default: %(default)s); otherwise it "
+                             "goes back to the mode it was in")
+    parser.add_argument("--leave-sport-off", action="store_true",
+                        help="don't switch sport mode back on after the run")
     parser.add_argument("--max-state-age", type=bounded(0.02, 1.0), default=MAX_STATE_AGE,
                         help="stop if the newest robot state is older than this many seconds, by the "
                              "robot's own clock (default: %(default)s)")
@@ -1207,7 +1280,11 @@ def main():
     if saved:
         print(f"Log: {saved}")
     if args.robot:
-        print(f"Sport mode is off (it was {original_mode!r}). Restart the robot to get it back.")
+        mode = original_mode or args.sport_mode  # "" if an earlier run had already released it
+        if args.leave_sport_off:
+            print("Sport mode is off (--leave-sport-off). Switch it on from the app, or restart the robot.")
+        else:
+            restore_sport_mode(mode, monitor, finished=status == 0)
     return status
 
 
