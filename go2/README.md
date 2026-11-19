@@ -331,7 +331,7 @@ These go straight to damping, which lets the robot sink to the ground:
 - Joint speed above 25 rad/s (hip, thigh) or 14 rad/s (calf)
 - A motor at 70 °C
 - A joint at its limit
-- The newest robot state is more than 0.1 s old. The age is measured against the robot's own clock (the state's `tick`), so it also catches states that arrived on time but waited in a queue: on 2026-11-19 a walk ran on states 0.3–0.7 s old while the arrival time said 2 ms. The SDK's subscriber now reads every waiting message instead of one per notification, which was the cause. Neither change has been retested on the robot yet. If the fault happens, keep the log and note the message.
+- The newest robot state is more than 0.1 s old. The age is measured against the robot's own clock (the state's `tick`), so it also catches states that arrived on time but waited in a queue: on 2026-11-19 a walk ran on states 0.3–0.7 s old while the arrival time said 2 ms. The cause was that DDS called a Python handler for every state on its own receive thread, and that thread waited for the interpreter while the control loop kept it busy, so states queued up behind it. `run_policy.py`, `sysid.py`'s control tests and `watch.py` now collect the newest states themselves (`ChannelSubscriber.InitPolled`) instead. Against a stand-in robot on the loopback interface, with the control loop loaded until it ran at 200 Hz, the old way fell 1 s behind within 3 s and the new way stayed 1-2 ms behind. It hasn't been retested on the robot yet. If the fault happens, keep the log and note the message.
 - The control loop stalling for 0.2 s, or the policy failing
 - The terminal or SSH session closing, or SIGTERM. Its output then goes to `go2/logs/hangup.log`. A closed terminal never counts as pressing Enter.
 

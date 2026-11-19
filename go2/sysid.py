@@ -187,10 +187,16 @@ def phases_seconds(phases):
 
 
 class ArrivalMonitor(rp.StateMonitor):
-    """run_policy's StateMonitor, also keeping when every message arrived and its tick."""
+    """run_policy's StateMonitor, also keeping when each message it got arrived, and its tick.
 
-    def __init__(self, keep_states=False):
-        super().__init__()
+    Given a subscriber it is polled by the control loop, so it gets the newest message
+    each cycle and not the ones in between: arrivals then shows what the loop saw, and
+    timing() counts the states it skipped as missed. Without one, DDS calls it for every
+    message, which is what the passive test wants.
+    """
+
+    def __init__(self, subscriber=None, keep_states=False):
+        super().__init__(subscriber)
         self.arrivals = []
         self.states = [] if keep_states else None
 
@@ -210,11 +216,15 @@ def connect(robot, domain, keep_states=False):
     if robot and not rp.check_interface(robot):
         raise Refused(f"interface {robot} can't be used")
     rp.ChannelFactoryInitialize(domain, interface)
-    monitor = ArrivalMonitor(keep_states)
     subscriber = rp.ChannelSubscriber("rt/lowstate", rp.LowState_)
-    subscriber.Init(monitor)  # no queue: see run_policy.connect
+    if keep_states:  # the passive test: every message, and nothing else is running
+        monitor = ArrivalMonitor(keep_states=True)
+        subscriber.Init(monitor)
+    else:  # a control loop will poll it: see run_policy.StateMonitor
+        subscriber.InitPolled()
+        monitor = ArrivalMonitor(subscriber)
     deadline = time.perf_counter() + 5.0
-    while monitor.msg is None:
+    while monitor.poll() is None:
         if time.perf_counter() > deadline:
             where = "Is the robot connected?" if robot else "Is go2/sim_headless.py running?"
             raise Refused(f"no rt/lowstate on {interface}, domain {domain}, after 5 s. {where}")
@@ -234,9 +244,8 @@ class SysidController(rp.Controller):
         self._stamp, self._tick = 0.0, 0
 
     def latest_state(self, check_range):
-        msg, stamp = self.monitor.msg, self.monitor.stamp
-        state = super().latest_state(check_range)
-        self._stamp, self._tick = stamp, msg.tick
+        state = super().latest_state(check_range)  # this reads the newest message
+        self._stamp, self._tick = self.monitor.stamp, self.monitor.msg.tick
         return state
 
     def record(self, stage, state, target, q_cmd):
@@ -279,7 +288,7 @@ class SysidController(rp.Controller):
 def prepare_robot(args, monitor, phases):
     if not sys.stdin.isatty():
         raise Refused("--robot needs an interactive terminal, for the confirmations")
-    state = read_state(monitor.msg)
+    state = read_state(monitor.poll())
     problem = safety_problem(state, check_range=False)
     if problem:
         raise Refused(problem)

@@ -8,7 +8,7 @@ from cyclonedds.internal import dds_c_t
 from cyclonedds.pub import DataWriter
 from cyclonedds.sub import DataReader
 from cyclonedds.topic import Topic
-from cyclonedds.qos import Qos
+from cyclonedds.qos import Qos, Policy
 from cyclonedds.core import DDSException, Listener
 from cyclonedds.util import duration
 from cyclonedds.internal import dds_c_t, InvalidSample
@@ -34,8 +34,6 @@ class Channel:
     " internal class __Reader
     """
     class __Reader:
-        __TAKE_BATCH = 64  # samples taken from DDS per read
-
         def __init__(self):
             self.__reader = None
             self.__handler = None
@@ -43,6 +41,7 @@ class Channel:
             self.__queueEnable = False
             self.__threadEvent = None
             self.__threadReader = None
+            self.__depth = 1
         
         def Init(self, participant: DomainParticipant, topic: Topic, qos: Qos = None, handler: Callable = None, queueLen: int = 0):
             if handler is None:
@@ -56,6 +55,32 @@ class Channel:
                     self.__threadReader = Thread(target=self.__ChannelReaderThreadFunc, name="ch_reader", daemon=True)
                     self.__threadReader.start()
                 self.__reader = DataReader(participant, topic, qos, Listener(on_data_available=self.__OnDataAvailable))
+
+        def InitPolled(self, participant: DomainParticipant, topic: Topic, depth: int = 1):
+            # A reader with no callback, read with ReadAll or ReadLatest. It keeps the newest
+            # `depth` samples and drops older ones.
+            #
+            # With a handler, DDS calls into Python on its receive thread for every sample, and
+            # that thread can't take the next packet until the call returns. When the Python
+            # program is busy the call waits, packets queue up behind it, and the handler ends
+            # up with samples that are seconds old. Without a handler DDS stores each sample
+            # itself, so a busy program always finds the newest one waiting.
+            self.__reader = DataReader(participant, topic, Qos(Policy.History.KeepLast(depth)))
+            self.__depth = depth
+
+        def ReadAll(self):
+            # The samples that arrived since the last call, oldest first. Never blocks.
+            try:
+                samples = self.__reader.take(self.__depth)
+            except DDSException as e:
+                print("[Reader] catch DDSException error. msg:", e.msg)
+                return []
+            return [sample for sample in samples if not isinstance(sample, InvalidSample)]
+
+        def ReadLatest(self):
+            # The newest sample that arrived since the last call, or None. Never blocks.
+            samples = self.ReadAll()
+            return samples[-1] if samples else None
 
         def Read(self, timeout: float = None):
             sample = None
@@ -84,39 +109,32 @@ class Channel:
                 self.__threadReader.join()
 
         def __OnDataAvailable(self, reader: DataReader):
-            # Take everything that is waiting, oldest first. This used to take one sample per
-            # call. DDS can raise this callback once for several arrivals, for example while
-            # the Python thread it needs is busy, and each time that happened one more sample
-            # was left queued. The handler then got samples that were seconds old.
-            while True:
-                try:
-                    samples = reader.take(self.__TAKE_BATCH)
-                except DDSException as e:
-                    print("[Reader] catch DDSException error. msg:", e.msg)
-                    return
-                except TimeoutError as e:
-                    print("[Reader] take sample timeout")
-                    return
-                except:
-                    print("[Reader] take sample error")
-                    return
+            samples = []
+            try:
+                samples = reader.take(1)
+            except DDSException as e:
+                print("[Reader] catch DDSException error. msg:", e.msg)
+                return
+            except TimeoutError as e:
+                print("[Reader] take sample timeout")
+                return
+            except:
+                print("[Reader] take sample error")
+                return
 
-                if not samples:
-                    return
+            if samples is None:
+                return
 
-                for sample in samples:
-                    # check invalid sample
-                    if isinstance(sample, InvalidSample):
-                        continue
+            # check invalid sample        
+            sample = samples[0]
+            if isinstance(sample, InvalidSample):
+                return
 
-                    # do sample
-                    if self.__queueEnable:
-                        self.__queue.Put(sample)
-                    else:
-                        self.__handler(sample)
-
-                if len(samples) < self.__TAKE_BATCH:
-                    return
+            # do sample
+            if self.__queueEnable:
+                self.__queue.Put(sample)
+            else:
+                self.__handler(sample)
 
         def __ChannelReaderThreadFunc(self):
             while not self.__threadEvent.is_set():
@@ -180,6 +198,15 @@ class Channel:
 
     def SetReader(self, qos: Qos = None, handler: Callable = None, queueLen: int = 0):
         self.__reader.Init(self.__participant, self.__topic, qos, handler, queueLen)
+
+    def SetPolledReader(self, depth: int = 1):
+        self.__reader.InitPolled(self.__participant, self.__topic, depth)
+
+    def ReadAll(self):
+        return self.__reader.ReadAll()
+
+    def ReadLatest(self):
+        return self.__reader.ReadLatest()
         
     def Write(self, sample: Any, timeout: float = None):
         return self.__writer.Write(sample, timeout)
@@ -294,12 +321,26 @@ class ChannelSubscriber:
             self.__channel.SetReader(None, handler, queueLen)
             self.__inited = True
 
+    def InitPolled(self, depth: int = 1):
+        """Subscribe with no handler, keeping the newest `depth` samples for ReadAll and ReadLatest."""
+        if not self.__inited:
+            self.__channel.SetPolledReader(depth)
+            self.__inited = True
+
     def Close(self):
         self.__channel.CloseReader()
         self.__inited = False
 
     def Read(self, timeout: int = None):
         return self.__channel.Read(timeout)
+
+    def ReadAll(self):
+        """The samples that arrived since the last call, oldest first. Never blocks. Needs InitPolled."""
+        return self.__channel.ReadAll()
+
+    def ReadLatest(self):
+        """The newest sample that arrived since the last call, or None. Never blocks. Needs InitPolled."""
+        return self.__channel.ReadLatest()
 
 """
 " function ChannelFactoryInitialize. used to intialize channel everenment.

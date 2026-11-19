@@ -44,7 +44,6 @@ import select
 import signal
 import sys
 import termios
-import threading
 import time
 import traceback
 from datetime import datetime
@@ -133,6 +132,7 @@ LOG_FIELDS = ("t", "stage", "q", "dq", "target", "q_cmd", "tau_est", "temperatur
               "tick", "state_age", "quaternion", "imu_rpy", "foot_force_est", "ddq", "motor_lost",
               "battery", "est_velocity", "est_height", "est_contact_weight", "robot_state")
 ODOM_TOPIC = "rt/utlidar/robot_odom"
+ODOM_DEPTH = 64  # messages kept between two reads; it publishes at most a few hundred a second
 
 # Policy calls per probe in check_policy: 20 s at 10 Hz, past the start-up phase
 # of the policies so far (crab reads height and velocity from its fifth call).
@@ -162,25 +162,41 @@ class Fault(Exception):
 
 
 class StateMonitor:
-    """Keep the latest rt/lowstate message, when it arrived, and how late it arrived.
+    """The newest rt/lowstate message, when it was read, and how late that was.
 
-    A message can sit in a queue before it gets here, so its arrival time doesn't say how
-    old it is. The robot stamps each one with its own clock (tick, in ms). The smallest
-    gap seen between that clock and ours is a message that came straight through, and
-    `delay` is how much longer than that the latest one took. The smallest gap is taken
-    over the last one to two DELAY_WINDOW_S, so a slow drift between the two clocks
-    doesn't build up. Without a tick that advances (the simulator sends 0), delay is 0.
+    With a subscriber made by ChannelSubscriber.InitPolled, poll() fetches the newest
+    message, and the control loop calls it every cycle. DDS isn't given a handler to
+    call instead: its handler calls wait for the Python interpreter, and while the control
+    loop kept the interpreter busy they fell up to 2 s behind (the robot runs of
+    2026-11-19). Without a subscriber, DDS calls the monitor itself, which is fine for a
+    program that does nothing else (go2/sysid.py passive).
+
+    A message's read time doesn't say how old it is. The robot stamps each one with its
+    own clock (tick, in ms). The smallest gap seen between that clock and ours is a
+    message that came straight through, and `delay` is how much longer than that the
+    latest one took. The smallest gap is taken over the last one to two DELAY_WINDOW_S,
+    so a slow drift between the two clocks doesn't build up. Without a tick that advances
+    (the simulator sends 0), delay is 0.
     """
 
     DELAY_WINDOW_S = 60.0
 
-    def __init__(self):
+    def __init__(self, subscriber=None):
         self.msg = None
         self.stamp = 0.0
         self.delay = 0.0
+        self._subscriber = subscriber
         self._tick = None
         self._gaps = [math.inf, math.inf]  # smallest gap in the previous window, and in this one
         self._window_end = 0.0
+
+    def poll(self):
+        """Fetch the newest message, if a new one has arrived. Returns the newest message."""
+        if self._subscriber is not None:
+            msg = self._subscriber.ReadLatest()
+            if msg is not None:
+                self(msg)
+        return self.msg
 
     def note_arrival(self, msg, stamp):
         tick = msg.tick
@@ -661,6 +677,7 @@ def dry_run(monitor, seconds, step_hz, target_at, estimator=None):
         elapsed = time.perf_counter() - start
         if elapsed >= seconds:
             return
+        monitor.poll()
         age = monitor.age()
         if age > MAX_STATE_AGE:
             raise Fault(f"the newest robot state is {age * 1000:.0f} ms old")
@@ -699,6 +716,7 @@ class Controller:
         self.worst_overrun = 0.0
         self.worst_state_age = 0.0
         self.max_state_age = MAX_STATE_AGE
+        self.odom = None  # an OdomRecorder to poll every cycle, if there is one
         self.policy_calls = self.target_changes = 0
         self.worst_policy_time = 0.0
         self.calls = []  # (t, robot_state, target, state age, env, gains) per policy call, for go2/diagnose.py
@@ -718,6 +736,9 @@ class Controller:
             motor.dq = 0.0  # VEL_STOP with kd > 0 would ask for a huge torque in the simulator
 
     def latest_state(self, check_range):
+        self.monitor.poll()
+        if self.odom is not None:
+            self.odom.poll()
         age = self.monitor.age()
         if age > self.max_state_age:
             raise Fault(f"the newest robot state is {age * 1000:.0f} ms old "
@@ -911,21 +932,21 @@ class OdomRecorder:
     """Keep every rt/utlidar/robot_odom message for the log. Nothing acts on them."""
 
     def __init__(self):
-        self._lock = threading.Lock()
         self._rows = []
         self._subscriber = ChannelSubscriber(ODOM_TOPIC, Odometry_)
-        self._subscriber.Init(self)  # no queue: see the rt/lowstate subscriber below
+        self._subscriber.InitPolled(ODOM_DEPTH)  # no handler: see StateMonitor
 
-    def __call__(self, msg):
-        p, q = msg.pose.pose.position, msg.pose.pose.orientation
-        row = (time.perf_counter(), p.x, p.y, p.z, q.w, q.x, q.y, q.z)
-        with self._lock:
-            self._rows.append(row)
+    def poll(self):
+        """Collect the messages that arrived since the last call, stamped with the time now."""
+        now = time.perf_counter()
+        for msg in self._subscriber.ReadAll():
+            p, q = msg.pose.pose.position, msg.pose.pose.orientation
+            self._rows.append((now, p.x, p.y, p.z, q.w, q.x, q.y, q.z))
 
     def columns(self, clock_start):
-        """odom_t on the log's clock, and odom_pose as x, y, z, qw, qx, qy, qz."""
-        with self._lock:
-            rows = np.array(self._rows) if self._rows else np.empty((0, 8))
+        """odom_t on the log's clock (when each message was collected), and odom_pose as x, y, z, qw, qx, qy, qz."""
+        self.poll()
+        rows = np.array(self._rows) if self._rows else np.empty((0, 8))
         return {"odom_t": rows[:, 0] - clock_start, "odom_pose": rows[:, 1:]}
 
 
@@ -936,13 +957,11 @@ def connect(args):
     if args.robot and not check_interface(args.robot):
         raise Refused(f"interface {args.robot} can't be used")
     ChannelFactoryInitialize(domain, interface)
-    monitor = StateMonitor()
     subscriber = ChannelSubscriber("rt/lowstate", LowState_)
-    # No queue. A queue length adds a reader thread that competes with the 500 Hz loop for the
-    # GIL. On the robot that held back state updates for 100 ms and tripped the stale-state fault.
-    subscriber.Init(monitor)
+    subscriber.InitPolled()  # no handler, and only the newest state is kept: see StateMonitor
+    monitor = StateMonitor(subscriber)
     deadline = time.perf_counter() + 5.0
-    while monitor.msg is None:
+    while monitor.poll() is None:
         if time.perf_counter() > deadline:
             where = "Is the robot connected?" if args.robot else "Is go2/sim_headless.py running?"
             raise Refused(f"no rt/lowstate on {interface}, domain {domain}, after 5 s. {where}")
@@ -958,7 +977,7 @@ def confirm_stop_button(monitor):
     print("Press and release B on the remote to show that the stop button works.", flush=True)
     deadline = time.perf_counter() + 30.0
     for wanted in (True, False):
-        while read_state(monitor.msg).stop_pressed is not wanted:
+        while read_state(monitor.poll()).stop_pressed is not wanted:
             if time.perf_counter() > deadline:
                 raise Refused("didn't see B pressed and released. Is the remote on?")
             time.sleep(0.01)
@@ -1023,7 +1042,7 @@ def restore_sport_mode(name, monitor, finished):
     robot isn't level, it asks first: whatever made the run stop may still be there.
     Returns True if sport mode is on.
     """
-    tilt = np.abs(read_state(monitor.msg).rpy[:2]).max()
+    tilt = np.abs(read_state(monitor.poll()).rpy[:2]).max()
     if not finished or tilt > MAX_STAND_TILT:
         why = "the run didn't finish" if not finished else f"the robot is tilted {tilt:.2f} rad"
         signal.signal(signal.SIGINT, signal.default_int_handler)  # damping is over; Ctrl-C answers no
@@ -1058,7 +1077,7 @@ def prepare_robot(args, monitor, digest):
     """Run the checks and confirmations for a real robot. Return the original mode."""
     if not sys.stdin.isatty():
         raise Refused("--robot needs an interactive terminal, for the confirmations")
-    state = read_state(monitor.msg)
+    state = read_state(monitor.poll())
     problem = safety_problem(state, check_range=False)
     if problem:
         raise Refused(problem)
@@ -1208,7 +1227,7 @@ def main():
                 dry_run(monitor, args.seconds, args.rate,
                         lambda elapsed, state: trajectory_target(rows, args.rate, elapsed))
             else:
-                start_yaw = read_state(monitor.msg).rpy[2]
+                start_yaw = read_state(monitor.poll()).rpy[2]
                 estimator = BaseEstimator(calibration=estimator_calibration(args.calibration_data))
 
                 def target_at(elapsed, state):
@@ -1232,6 +1251,7 @@ def main():
     controller = Controller(monitor, publisher, args.kp, args.kd, args.torque_fraction,
                             None if args.no_calibration else args.calibration_data)
     controller.max_state_age = args.max_state_age
+    controller.odom = odom
     outcome = "finished"
     status = 0
     try:
