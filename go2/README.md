@@ -2,7 +2,7 @@
 
 Follow these steps on the Ubuntu computer wired to the robot. They end with a read-only check that sends no commands to the robot.
 
-**Don't run other scripts yet.** Unitree's examples can move the robot as soon as you give them a network interface. `stand_test.py` only works with the simulator, so it can't reach the robot. `run_policy.py` only reaches the robot if you pass `--robot`, and [Run a policy](#run-a-policy) covers when to do that. `check_lidar.py`, `lidar_map.py` and `push_box_map.py` are also read-only, and [Check the lidar](#check-the-lidar) covers them. So is `check_odom.py`, which [Check the odometry](#check-the-odometry) covers. `phone_camera.py` never talks to the robot, and [Film with a phone](#film-with-a-phone) covers it. `tag_tracker.py` and `make_tag_sheets.py` only read videos and write files, and [Measure the walk with AprilTags](#measure-the-walk-with-apriltags) covers them.
+**Don't run other scripts yet.** Unitree's examples can move the robot as soon as you give them a network interface. `stand_test.py` only works with the simulator, so it can't reach the robot. `run_policy.py` only reaches the robot if you pass `--robot`, and [Run a policy](#run-a-policy) covers when to do that. `check_lidar.py`, `lidar_map.py` and `push_box_map.py` are also read-only, and [Check the lidar](#check-the-lidar) covers them. So is `check_odom.py`, which [Check the odometry](#check-the-odometry) covers. `phone_camera.py` never talks to the robot, and [Film with a phone](#film-with-a-phone) covers it. `tag_tracker.py` and `make_tag_sheets.py` only read videos and write files, and [Measure the walk with AprilTags](#measure-the-walk-with-apriltags) covers them. `watch.py` is read-only too, and [Diagnose a failed transfer](#diagnose-a-failed-transfer) covers it with `diagnose.py`. `sysid.py passive` is read-only, but `sysid.py hang` and `sysid.py stand` move the robot, and [Measure the robot for the simulator](#measure-the-robot-for-the-simulator) covers them. `calibrate.py` runs these and the input check in order before a session, and says before each step whether it moves the robot. [ROBOT_SESSION.md](ROBOT_SESSION.md) covers it.
 
 ## 1. Install
 
@@ -209,9 +209,13 @@ It takes all three of S-M-ICRL's policy forms: a file that ends with `robot.simu
 
 `policies/walk_tmnxt_iter17.py` is an unchanged copy of `iter_17/code.py` from the run `walk_2026-10-27_17-37-32_TMNXT`. The script's default rate and gains (5 Hz, kp 80, kd 4) come from that run. Keep them for this policy, because the rate sets its gait and lower gains make it walk much less far. A policy from another run needs the values from that run's `config.json`.
 
-The script feeds the policy fixed flat-floor values instead of real terrain probes, so **the robot can't sense steps or obstacles**.
+The robot can't measure body velocity and height (`robot_state[30:34]`), or the env vector's ground probes. By default `state_estimator.py` estimates them every control cycle from the leg kinematics, IMU and foot force sensors:
 
-It refuses a policy whose output depends on body height or linear velocity (`robot_state[30:34]`), because the robot can't measure them. It checks 200 calls of the policy, so it also catches a policy that only reads them after its start-up phase. `--fill-unmeasured` feeds velocity 0 and a base height of 0.27 m instead of refusing (`--fill-unmeasured 0.25` sets another height). The policy then runs as if its body never moved, so test it that way in simulation first. A policy may keep state between calls. `--check` only loads and checks the policy, without connecting to anything. S-M-ICRL's real-robot loop uses it before each run.
+- Velocity and height go into `robot_state[30:34]`. In S-M-ICRL with robot-like noise they were within 1.5 cm/s and 3 mm of the truth on the walk. They haven't been tried on the robot yet, so `calibrate.py` checks them against sport mode's estimate first.
+- The probes are minus the estimated height, which is what S-M-ICRL gives on a flat floor. As in S-M-ICRL, the env vector is rebuilt at 25 Hz (`--env-hz`) and multiplied by the policy's latest matrix every cycle. Clearance and obstacle distance are always "open", so **the robot can't sense steps or obstacles**.
+- `--fill-unmeasured` feeds velocity 0 and a base height of 0.27 m instead (`--fill-unmeasured 0.25` sets another height), as if the body never moved, so test that in simulation first. `--no-estimate` feeds nothing and refuses a policy whose output depends on velocity or height. It checks 200 calls of the policy, so it also catches a policy that only reads them after its start-up phase.
+
+With `--robot` it needs a calibration from `calibrate.py` that passed, for this robot (see [ROBOT_SESSION.md](ROBOT_SESSION.md)). It refuses without one, and `--no-calibration` overrides that. A policy may keep state between calls. `--check` only loads and checks the policy, without connecting to anything. S-M-ICRL's real-robot loop uses it before each run.
 
 ### Test in the simulator
 
@@ -241,7 +245,7 @@ S-M-ICRL's real-robot loop can run each policy here first, in the window, for yo
 
 ### Test on the robot
 
-**None of this has been tried on a real robot yet.** Do these stages in order, and stop if anything looks or sounds wrong. You need sections 1-4 above done, `$IFACE` set, the remote, and a harness or stand that can hold the robot.
+**None of this has been tried on a real robot yet.** Do these stages in order, and stop if anything looks or sounds wrong. You need sections 1-4 above done, `$IFACE` set, the remote, and a harness or stand that can hold the robot. Stage 1 needs nothing else. Run `calibrate.py` ([ROBOT_SESSION.md](ROBOT_SESSION.md) Part A) before stage 2, because the stages that move the robot refuse without a passing calibration.
 
 The script asks you to type `yes` and press B on the remote, then lies the robot down and turns sport mode off. It stands up and waits for you to press Enter before walking.
 
@@ -284,11 +288,13 @@ python go2/run_policy.py go2/policies/walk_tmnxt_iter17.py --robot "$IFACE" --se
 
 ### Crab (sideways walk)
 
-`policies/crab_biahd_iter35.py` is an unchanged copy of `iter_35/code.py` from the run `crab_2026-10-27_10-10-07_BIAHD`. It trots to its left in a 1.4 s cycle. It corrects its heading with the IMU, and corrects forward drift and body height with velocity and height, which the robot can't measure. So it needs `--fill-unmeasured`, and its own rate:
+`policies/crab_biahd_iter35.py` is an unchanged copy of `iter_35/code.py` from the run `crab_2026-10-27_10-10-07_BIAHD`. It trots to its left in a 1.4 s cycle. It corrects its heading with the IMU, and corrects forward drift and body height with velocity and height, which come from the estimate (the default). It needs its own rate:
 
 ```bash
-python go2/run_policy.py go2/policies/crab_biahd_iter35.py --policy-hz 10 --fill-unmeasured --torque-fraction 0.8 --seconds 17
+python go2/run_policy.py go2/policies/crab_biahd_iter35.py --policy-hz 10 --torque-fraction 0.8 --seconds 17
 ```
+
+With the estimate, in S-M-ICRL with robot-like sensor noise, it went 2.36 m sideways against 2.53 m with the true values. The crab slides sideways in simulation, so its sideways speed read about 0.06 m/s low. Add `--fill-unmeasured` to run it on constants instead, as the figures below were.
 
 Keep kp 80 and kd 4 (the defaults). The policy walks for 15.4 s after a 0.4 s settle, then holds its pose, so `--seconds 17` covers a whole run.
 
@@ -327,12 +333,88 @@ These go straight to damping, which lets the robot sink to the ground:
 - A joint at its limit
 - No robot state for 0.1 s. An early robot run tripped this while standing, because of how the script read the state, not because of the robot. That's fixed but not yet retested on the robot. If it happens again, keep the log and note `oldest state` in the summary.
 - The control loop stalling for 0.2 s, or the policy failing
+- The terminal or SSH session closing, or SIGTERM. Its output then goes to `go2/logs/hangup.log`. A closed terminal never counts as pressing Enter.
 
 **Nothing protects the robot if the script is killed, the computer fails, or the cable comes out.** Stage 2 shows you what happens then.
+
+**Over SSH, run everything in tmux on the robot computer** (`tmux new -s go2`, `Ctrl-b %` for a second pane, `tmux attach -t go2` to get back after a dropped connection). Then a dropped connection doesn't stop anything. Without tmux, it stops the run and damps the motors, as above. `sysid.py`, `calibrate.py` and `watch.py` handle a closed terminal the same way.
 
 The script aims to keep torque within 80% of the limits (`--torque-fraction`). Peaks can go above that. At the old 60% default the thigh reached about 21 N·m in simulation, against a 14 N·m target and a 23.7 N·m limit. On the robot, 60% held the thighs back for about half of each walk, so they often didn't finish a swing before the next policy call and the gait staggered. The 80% default hasn't been tried in simulation or on the robot yet. Expect thigh peaks at the 23.7 N·m limit, where the motor saturates.
 
 Each run saves its data to `go2/logs/<time>.npz`, including `rt/utlidar/robot_odom` when it publishes. Sport mode stays off after a run, so restart the robot to get it back.
+
+## Measure the robot for the simulator
+
+`sysid.py` runs the same tests on the robot, on `sim_headless.py`, and in S-M-ICRL's physics (`--smicrl`), then lines up the results. Use it when a policy that works in simulation fails on the robot. It measures command-to-response latency, torque scale, tracking gain and phase from 0.5 to 4 Hz, Coulomb and viscous friction per joint type, standing sag and holding torque, state rate and sensor noise.
+
+S-M-ICRL's training sim differs from the robot in ways these tests show. Its PD law adds gravity compensation (`qfrc_bias`) to every joint and applies each target with no delay. Its joints use `frictionloss` 0.2 and `damping` 0.1. The robot's motors do none of this, so `compare` shows each difference and the change that would close it.
+
+`calibrate.py` runs `passive`, `hang` and `stand` as part of its steps. To run them on their own, do these in order, after section 4 and stage 1 of [Test on the robot](#test-on-the-robot):
+
+```bash
+# 1. Read-only, about 10 s. Robot lying down or standing still in sport mode.
+python go2/sysid.py passive --robot "$IFACE"
+
+# 2. MOVES THE LEGS, about 2.5 minutes. Hanging in a harness, all four feet clear.
+python go2/sysid.py hang --robot "$IFACE"
+
+# 3. MOVES THE ROBOT, about 20 s. On a flat floor.
+python go2/sysid.py stand --robot "$IFACE"
+```
+
+`hang` asks you to type `hanging`, and like `run_policy.py` it needs B pressed, releases sport mode, stands up and waits for Enter. Steps are 0.1 rad, sines 0.1 rad and ramps at most 0.25 rad from the home pose. `--scale 0.5` halves them, and `--groups thigh` tests one joint type. The faults in [What stops a run](#what-stops-a-run) apply.
+
+Then run the same tests in S-M-ICRL's physics, which takes seconds and doesn't need a simulator running, and compare, robot first:
+
+```bash
+python go2/sysid.py hang --smicrl ../S-MICRL/Robots/go2/scene.xml
+python go2/sysid.py stand --smicrl ../S-MICRL/Robots/go2/scene.xml
+python go2/sysid.py compare go2/logs/sysid/*_hang_robot.json go2/logs/sysid/*_hang_smicrl.json
+```
+
+Pass the scene your S-M-ICRL config's `xml_path` names. `--no-gravity-comp` runs it without S-M-ICRL's gravity compensation. In `sim_headless.py`, start the simulator with `--flat --dt 0.002 --hang` for `hang` (the body is welded in the air) and without `--hang` for `stand`, then run the same commands without `--robot`.
+
+`analyze` reads a `run_policy.py` log from a real walk and reports peak and 99th-percentile torque per joint type, the peak torque in each speed band, how often the torque cap moved a target, and how far and how late the joints followed their targets:
+
+```bash
+python go2/sysid.py analyze go2/logs/<time>.npz
+```
+
+Each test saves `go2/logs/sysid/<time>_<test>_<robot|sim|smicrl>.npz` and its results as `.json` next to it.
+
+## Diagnose a failed transfer
+
+When a policy walks in S-M-ICRL but not on the robot, record the run from a second terminal and compare it with the same policy in S-M-ICRL.
+
+1. Make a reference once per policy. Run it in S-M-ICRL's Python environment, with the task config the policy was trained with. It runs the policy file through S-M-ICRL's own trial code, including its latency and frequencies:
+
+```bash
+python go2/diagnose.py reference go2/policies/POLICY.py --smicrl ../S-MICRL --config func_config/go2/walk/walk.yaml
+```
+
+2. Start the watcher, then run the policy as usual, at the config's `policy_hz`. The watcher is read-only. It prints the command-to-torque latency measured during the walk, saturation, tilt and timing every second, and saves when the commands stop:
+
+```bash
+nice -n 10 python go2/watch.py --robot "$IFACE"                                   # terminal 1
+python go2/run_policy.py go2/policies/POLICY.py --robot "$IFACE" --policy-hz 10   # terminal 2
+```
+
+3. Compare:
+
+```bash
+python go2/diagnose.py report go2/logs/<time>.npz --watch go2/logs/watch/<time>.npz --reference go2/logs/reference/POLICY.npz
+```
+
+The report prints the S-M-ICRL sweep's columns (x, y, vx, yaw, minh, fell, sat%, sw/call) for the reference and the robot. It also shows how much of each commanded joint move was done by the next policy call (`reach`), torque saturation and cap clipping, call timing, foot contacts, and the policy inputs the robot fed that the reference never saw. It ends with a list of likely causes and saves everything as `<log>.diagnosis.json`. sw/call, reach and the input checks need a run_policy.py log made after per-call logging was added.
+
+`calibrate.py` does this as one of its steps. To check that each policy input means on the robot what it means in S-M-ICRL on its own, record the robot walking in sport mode with the remote, then check the recording:
+
+```bash
+nice -n 10 python go2/watch.py --robot "$IFACE" --seconds 120   # walk it around with the remote meanwhile
+python go2/diagnose.py inputs go2/logs/watch/<time>.npz
+```
+
+It compares each of the 37 inputs with a second source: the joint angles' rate, the IMU's own rpy, the quaternion's rate, gravity in the accelerometer, Unitree's foot positions, and sport mode's velocity and height for the `--estimate` values. [ROBOT_SESSION.md](ROBOT_SESSION.md) has the full session plan and a table of what each input is on the robot.
 
 ## Check the odometry
 

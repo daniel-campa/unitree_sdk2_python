@@ -17,8 +17,13 @@ the file's joint angles, interpolated between samples, after a ramp to its first
 sample. A fault, the remote's B button or Ctrl-C goes straight
 to damping. Start the simulator with `python go2/sim_headless.py --flat --dt 0.002`.
 
-The log also keeps rt/utlidar/robot_odom, the robot's position estimate, when it
-publishes. Nothing here acts on it; S-M-ICRL scores walking with it.
+Body velocity and height (robot_state[30:34]) and the env vector's ground probes
+come from go2/state_estimator.py by default (--no-estimate, --fill-unmeasured). With
+--robot it needs a passing calibration from go2/calibrate.py (--no-calibration).
+
+The log keeps every input the policy saw, every cycle, and rt/utlidar/robot_odom, the
+robot's position estimate, when it publishes. Nothing here acts on the odometry;
+S-M-ICRL scores walking with it.
 
 POLICY.py is S-M-ICRL code that defines policy(robot_state) and ends with
 robot.simulate_rollout(policy), or a classifier that ends with
@@ -33,6 +38,7 @@ import argparse
 import builtins
 import hashlib
 import json
+import os
 import select
 import signal
 import sys
@@ -46,6 +52,8 @@ from typing import NamedTuple
 
 import numpy as np
 from check_connection import DEFAULT_INTERFACE, JOINTS, check_interface, state_problems
+from calibrate import calibration_problems, estimator_calibration, load_calibration
+from state_estimator import BaseEstimator
 from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient
 from unitree_sdk2py.core.channel import (
     ChannelFactoryInitialize,
@@ -81,6 +89,8 @@ PROBE_HEIGHT = 0.262
 OPEN_CLEARANCE, OPEN_OBSTACLE_DISTANCE = 2.0, 10.0
 
 DT = 0.002  # rt/lowcmd period, as in Unitree's examples
+ENV_HZ = 25.0  # S-M-ICRL's env_hz in the Go2 walk configs
+CALIBRATION_FILE = Path(__file__).resolve().parent / "logs" / "calibration" / "latest.json"
 STAND_UP_S = 3.0
 SETTLE_S = 2.0
 RETURN_HOME_S = 1.0
@@ -112,7 +122,12 @@ STAND_DOWN_S = 4.0
 RELEASE_ATTEMPTS = 5
 
 LOG_FIELDS = ("t", "stage", "q", "dq", "target", "q_cmd", "tau_est", "temperature", "rpy",
-              "gyro", "accel", "foot_force", "power_v", "power_a")
+              "gyro", "accel", "foot_force", "power_v", "power_a",
+              # Everything else, every cycle: the robot's own timing and readings, the
+              # estimator's output, and the full robot_state with the estimate in 30:34
+              # (what --estimate feeds; call_state has what the policy actually got).
+              "tick", "state_age", "quaternion", "imu_rpy", "foot_force_est", "ddq", "motor_lost",
+              "battery", "est_velocity", "est_height", "est_contact_weight", "robot_state")
 ODOM_TOPIC = "rt/utlidar/robot_odom"
 
 # Policy calls per probe in check_policy: 20 s at 10 Hz, past the start-up phase
@@ -167,6 +182,12 @@ class State(NamedTuple):
     power_v: float
     power_a: float
     stop_pressed: bool
+    tick: int = 0
+    imu_rpy: np.ndarray = None
+    foot_force_est: np.ndarray = None
+    ddq: np.ndarray = None
+    lost: np.ndarray = None
+    battery: int = 0
 
 
 def quat_to_rpy(w, x, y, z):
@@ -193,6 +214,12 @@ def read_state(msg):
         power_v=msg.power_v,
         power_a=msg.power_a,
         stop_pressed=bool(msg.wireless_remote[3] & STOP_BUTTON_MASK),
+        tick=int(msg.tick),
+        imu_rpy=np.array(imu.rpy),
+        foot_force_est=np.array(msg.foot_force_est),
+        ddq=np.array([motor.ddq for motor in motors]),
+        lost=np.array([motor.lost for motor in motors]),
+        battery=int(msg.bms_state.soc),
     )
 
 
@@ -203,40 +230,64 @@ def unmeasured_values(fill_height):
     return [0.0, 0.0, 0.0, fill_height]
 
 
-def build_robot_state(state, start_yaw, fill_height=None):
+def build_robot_state(state, start_yaw, fill_height=None, estimate=None):
     """Build S-M-ICRL's 37-element robot_state from what the robot can measure.
 
-    Linear velocity and height need sport mode or an estimator. They are NaN, and
-    check_policy refuses policies that use them, unless fill_height is given: then
-    velocity is 0 and height is fill_height, as if the body never moved.
+    Linear velocity and height (30:34) aren't measured. With estimate, a (velocity,
+    height) pair from go2/state_estimator.py with velocity in the IMU's world frame,
+    they come from it, turned so x is the heading at start_yaw, as in S-M-ICRL.
+    Otherwise they are NaN, and check_policy refuses policies that use them, unless
+    fill_height is given: then velocity is 0 and height is fill_height, as if the body
+    never moved.
     """
     w, x, y, z = state.quaternion
     roll, pitch, yaw = state.rpy
     yaw_deviation = np.arctan2(np.sin(yaw - start_yaw), np.cos(yaw - start_yaw))
     # Row 3 of the body rotation matrix, which is what S-M-ICRL reads from xmat[6:9].
     up = [2.0 * (x * z - w * y), 2.0 * (y * z + w * x), 1.0 - 2.0 * (x * x + y * y)]
+    if estimate is not None:
+        velocity, height = estimate
+        c, s = np.cos(start_yaw), np.sin(start_yaw)
+        vx, vy, vz = velocity
+        unmeasured = [c * vx + s * vy, -s * vx + c * vy, vz, height]
+    else:
+        unmeasured = unmeasured_values(fill_height)
     return np.concatenate([
-        state.q, state.dq, [roll, pitch, yaw_deviation], state.gyro,
-        unmeasured_values(fill_height), up,
+        state.q, state.dq, [roll, pitch, yaw_deviation], state.gyro, unmeasured, up,
     ])
 
 
 def flat_floor_env(probe_height):
-    """S-M-ICRL's env vector on a clear, flat floor: three probes, clearance, obstacle, bias."""
+    """S-M-ICRL's env vector on a clear, flat floor: three probes, clearance, obstacle, bias.
+
+    Each probe is the floor's height 0.3 m ahead minus the body's height, so on a flat
+    floor it is minus the body height. With --estimate it is rebuilt from the estimated
+    height at S-M-ICRL's env rate, as S-M-ICRL does; without, it's fixed at --probe-height.
+    """
     probe = -probe_height
     return np.array([probe, probe, probe, OPEN_CLEARANCE, OPEN_OBSTACLE_DISTANCE, 1.0])
 
 
-def policy_target(policy, robot_state, env):
+def policy_gains(policy, robot_state, env_size):
+    """The policy's (12, env_size) matrix for this state."""
     try:
         gains = np.asarray(policy(robot_state), dtype=float)
     except Exception as error:
         raise Fault(f"policy failed: {error}") from error
-    if gains.shape != (12, env.size):
-        raise Fault(f"policy returned shape {gains.shape}, expected (12, {env.size})")
+    if gains.shape != (12, env_size):
+        raise Fault(f"policy returned shape {gains.shape}, expected (12, {env_size})")
     if not np.isfinite(gains).all():
         raise Fault("policy returned non-finite values")
+    return gains
+
+
+def gains_target(gains, env):
+    """Joint targets, gains @ env clamped to the joint ranges, as S-M-ICRL does every step."""
     return np.clip(gains @ env, JOINT_LOW, JOINT_HIGH)
+
+
+def policy_target(policy, robot_state, env):
+    return gains_target(policy_gains(policy, robot_state, env.size), env)
 
 
 def limit_for_torque(target, q, dq, kp, kd, torque_cap):
@@ -514,19 +565,60 @@ def _on_terminate(signum, frame):
     raise KeyboardInterrupt
 
 
+HANGUP_LOG = Path(__file__).resolve().parent / "logs" / "hangup.log"
+
+
+def _on_hangup(signum, frame):
+    """The terminal or SSH session closed. Stop as for Ctrl-C, so the motors are damped.
+
+    Output goes to go2/logs/hangup.log from here on: writing to the closed terminal
+    would raise an error on the way to damping. Run in tmux and a dropped SSH
+    connection doesn't stop anything.
+    """
+    try:
+        HANGUP_LOG.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(HANGUP_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        os.dup2(fd, 1)
+        os.dup2(fd, 2)
+        print(f"\n{time.strftime('%Y-%m-%d %H:%M:%S')}: terminal closed (SIGHUP); stopping and damping.", flush=True)
+    except OSError:
+        pass
+    raise KeyboardInterrupt
+
+
+def stop_on_hangup():
+    """Handle SIGTERM and SIGHUP like Ctrl-C: stop, damp, save."""
+    signal.signal(signal.SIGTERM, _on_terminate)
+    signal.signal(signal.SIGHUP, _on_hangup)
+
+
+def ignore_stop_signals():
+    """While damping, nothing may interrupt it."""
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, signal.SIG_IGN)
+
+
+def read_enter():
+    """Consume a pressed Enter. False at end of input (closed terminal), which isn't a yes."""
+    return sys.stdin.readline() != ""
+
+
 def format_legs(values):
     legs = [" ".join(f"{v:+.2f}" for v in values[i:i + 3]) for i in range(0, 12, 3)]
     return " | ".join(f"{name} {leg}" for name, leg in zip(("FR", "FL", "RR", "RL"), legs))
 
 
-def dry_run(monitor, seconds, step_hz, target_at):
+def dry_run(monitor, seconds, step_hz, target_at, estimator=None):
     """Print what target_at(elapsed, state) would command, computing it step_hz times a second.
 
-    This creates no publisher or SDK client.
+    The estimator, if given, is updated at the control rate, as in a real run. This
+    creates no publisher or SDK client.
     """
     print("Dry run: nothing is published, so this can't move the robot.", flush=True)
     start = time.perf_counter()
     calls = 0
+    target = None
+    next_print = 0.0
     while True:
         elapsed = time.perf_counter() - start
         if elapsed >= seconds:
@@ -535,21 +627,30 @@ def dry_run(monitor, seconds, step_hz, target_at):
         if age > MAX_STATE_AGE:
             raise Fault(f"no robot state for {age * 1000:.0f} ms")
         state = read_state(monitor.msg)
-        target = target_at(elapsed, state)
-        if calls % max(1, round(step_hz)) == 0:
+        if estimator is not None:
+            estimator.update(monitor.stamp, state.q, state.dq, state.quaternion, state.gyro, state.accel,
+                             state.foot_force)
+        if target is None or elapsed >= calls / step_hz:
+            target = target_at(elapsed, state)
+            calls = int(elapsed * step_hz) + 1
+        if elapsed >= next_print:
+            next_print += 1.0
             roll, pitch, _ = state.rpy
-            print(f"t={elapsed:5.1f} s  roll={roll:+.2f}  pitch={pitch:+.2f}  "
-                  f"B button={'pressed' if state.stop_pressed else 'not pressed'}\n"
-                  f"  joints {format_legs(state.q)}\n"
-                  f"  target {format_legs(target)}", flush=True)
-        calls = int(elapsed * step_hz) + 1
-        time.sleep(max(0.0, start + calls / step_hz - time.perf_counter()))
+            line = (f"t={elapsed:5.1f} s  roll={roll:+.2f}  pitch={pitch:+.2f}  "
+                    f"B button={'pressed' if state.stop_pressed else 'not pressed'}")
+            if estimator is not None:
+                v = estimator.velocity
+                line += (f"  estimate: v={v[0]:+.2f},{v[1]:+.2f},{v[2]:+.2f} m/s  height={estimator.height:.3f} m  "
+                         f"standing feet {''.join('X' if c else '.' for c in estimator.contact)} "
+                         f"(from {estimator.contact_source})")
+            print(f"{line}\n  joints {format_legs(state.q)}\n  target {format_legs(target)}", flush=True)
+        time.sleep(max(0.0, DT - (time.perf_counter() - start - elapsed)))
 
 
 class Controller:
     """Stream rt/lowcmd at 500 Hz and check safety on every cycle."""
 
-    def __init__(self, monitor, publisher, kp, kd, torque_fraction):
+    def __init__(self, monitor, publisher, kp, kd, torque_fraction, calibration=None):
         self.monitor = monitor
         self.publisher = publisher
         self.kp, self.kd = kp, kd
@@ -561,6 +662,10 @@ class Controller:
         self.worst_state_age = 0.0
         self.policy_calls = self.target_changes = 0
         self.worst_policy_time = 0.0
+        self.calls = []  # (t, robot_state, target, state age, env, gains) per policy call, for go2/diagnose.py
+        # Runs every cycle, in every phase, so it has settled by the walk.
+        self.estimator = BaseEstimator(calibration=estimator_calibration(calibration))
+        self.start_yaw = None
 
         self.cmd = unitree_go_msg_dds__LowCmd_()
         self.cmd.head[0], self.cmd.head[1] = 0xFE, 0xEF
@@ -592,11 +697,23 @@ class Controller:
         self.cmd.crc = self.crc.Crc(self.cmd)
         self.publisher.Write(self.cmd)
 
+    def estimate(self, state):
+        """Fold the latest state into the estimator. Returns (velocity, height)."""
+        if self.start_yaw is None:
+            self.start_yaw = float(state.rpy[2])
+        return self.estimator.update(self.monitor.stamp, state.q, state.dq, state.quaternion, state.gyro,
+                                     state.accel, state.foot_force)
+
     def record(self, stage, state, target, q_cmd):
+        estimate = (self.estimator.velocity.copy(), self.estimator.height)
+        robot_state = build_robot_state(state, self.start_yaw or 0.0, estimate=estimate)
         self.records.append((
             time.perf_counter() - self.clock_start, stage, state.q, state.dq, target, q_cmd,
             state.tau_est, state.temperature, state.rpy, state.gyro, state.accel,
             state.foot_force, state.power_v, state.power_a,
+            state.tick, time.perf_counter() - self.monitor.stamp, state.quaternion, state.imu_rpy,
+            state.foot_force_est, state.ddq, state.lost, state.battery,
+            estimate[0], estimate[1], self.estimator.weight.copy(), robot_state,
         ))
 
     def run_phase(self, stage, seconds, target_at, check_range=True, stop_when=None):
@@ -610,6 +727,7 @@ class Controller:
             if elapsed >= seconds or (stop_when is not None and stop_when()):
                 return
             state = self.latest_state(check_range)
+            self.estimate(state)
             target = target_at(elapsed, state)
             q_cmd = limit_for_torque(target, state.q, state.dq, self.kp, self.kd, self.torque_cap)
             self.send(q_cmd, self.kp, self.kd)
@@ -658,26 +776,41 @@ class Controller:
         self.hold("waiting", HOME, GO_TIMEOUT_S, stop_when=entered)
         if not entered():
             return False
-        sys.stdin.readline()
-        return True
+        return read_enter()
 
-    def walk(self, policy, env, policy_hz, seconds, fill_height=None):
+    def walk(self, policy, env, policy_hz, seconds, fill_height=None, use_estimate=False, env_hz=None):
+        """Run the policy as S-M-ICRL's simulate_rollout does.
+
+        The policy gives a matrix every 1/policy_hz. The env vector is rebuilt every
+        1/env_hz (from the estimated height, with use_estimate), and the target is the
+        held matrix times the latest env vector, every cycle.
+        """
         start_yaw = self.latest_state(check_range=True).rpy[2]
-        target = None
-        next_call = 0
+        self.start_yaw = float(start_yaw)  # robot_state in the log is now relative to the walk's start
+        gains = target = None
+        next_call = next_env = 0
+        env_hz = env_hz or policy_hz
+        live_env = env.copy()
 
         def target_at(elapsed, state):
-            nonlocal target, next_call
-            if target is None or elapsed >= next_call / policy_hz:
-                robot_state = build_robot_state(state, start_yaw, fill_height)
+            nonlocal gains, target, next_call, next_env, live_env
+            if use_estimate and (gains is None or elapsed >= next_env / env_hz):
+                live_env = flat_floor_env(self.estimator.height)
+                next_env = int(elapsed * env_hz) + 1
+            if gains is None or elapsed >= next_call / policy_hz:
+                estimate = (self.estimator.velocity.copy(), self.estimator.height) if use_estimate else None
+                robot_state = build_robot_state(state, start_yaw, fill_height, estimate)
                 call_start = time.perf_counter()
-                new_target = policy_target(policy, robot_state, env)
+                gains = policy_gains(policy, robot_state, live_env.size)
                 self.worst_policy_time = max(self.worst_policy_time, time.perf_counter() - call_start)
+                new_target = gains_target(gains, live_env)
+                self.calls.append((call_start - self.clock_start, robot_state, new_target,
+                                   call_start - self.monitor.stamp, live_env.copy(), gains.copy()))
                 if target is not None and np.abs(new_target - target).max() > 0.1:
                     self.target_changes += 1
-                target = new_target
                 self.policy_calls += 1
                 next_call = int(elapsed * policy_hz) + 1  # skip calls missed in a stall
+            target = gains_target(gains, live_env)
             return target
 
         self.run_phase("walking", seconds, target_at)
@@ -714,6 +847,10 @@ class Controller:
             return None
         path.parent.mkdir(parents=True, exist_ok=True)
         columns = {name: np.array(column) for name, column in zip(LOG_FIELDS, zip(*self.records))}
+        if self.calls:
+            call_t, call_state, call_target, call_age, call_env, call_gains = (np.array(c) for c in zip(*self.calls))
+            columns.update(call_t=call_t, call_state=call_state, call_target=call_target,
+                           call_state_age=call_age, call_env=call_env, call_gains=call_gains)
         np.savez_compressed(path, meta=json.dumps(meta), **columns, **odom.columns(self.clock_start))
         return path
 
@@ -823,8 +960,27 @@ def prepare_robot(args, monitor, digest):
     battery = monitor.msg.bms_state.soc
     if battery < MIN_BATTERY_PERCENT:
         raise Refused(f"battery is at {battery}%, minimum {MIN_BATTERY_PERCENT}%")
-    inputs = ("" if args.fill_height is None else
-              f"  Inputs:  height fixed at {args.fill_height:g} m, body velocity at 0 (--fill-unmeasured)\n")
+    serial = "-".join(str(x) for x in monitor.msg.sn)
+    if not args.no_calibration:
+        refuse, warn = calibration_problems(args.calibration_data, serial, need_estimate=args.estimate)
+        for w in warn:
+            print(f"Note: {w}", flush=True)
+        if refuse:
+            raise Refused("; ".join(refuse) + " (or pass --no-calibration to run without one)")
+    if args.trajectory:
+        inputs = ""
+    elif args.estimate:
+        inputs = (f"  Inputs:  body velocity, height and probes from go2/state_estimator.py, env rebuilt at "
+                  f"{args.env_hz:g} Hz\n")
+    elif args.fill_height is not None:
+        inputs = f"  Inputs:  height fixed at {args.fill_height:g} m, body velocity at 0 (--fill-unmeasured)\n"
+    else:
+        inputs = "  Inputs:  body velocity and height not given (--no-estimate)\n"
+    if args.calibration_data and not args.no_calibration:
+        updated = datetime.fromtimestamp(args.calibration_data.get("updated", 0))
+        inputs += f"  Calibration: {args.calibration} ({updated:%Y-%m-%d %H:%M})\n"
+    elif args.no_calibration:
+        inputs += "  Calibration: none (--no-calibration)\n"
     if args.trajectory:
         source = f"  Trajectory: {args.trajectory} (sha256 {digest[:12]}), open loop\n"
         rate = args.rate
@@ -883,9 +1039,24 @@ def parse_args():
                         type=bounded(0.05, 0.5), const=0.27,
                         help="feed body velocity 0 and this base height in meters (if none is given: "
                              "%(const)s) instead of refusing a policy that reads them")
+    parser.add_argument("--no-estimate", dest="estimate", action="store_false",
+                        help="don't estimate body velocity and height (robot_state[30:34]) and the probes; by "
+                             "default go2/state_estimator.py does, from the legs, IMU and foot force sensors")
+    parser.add_argument("--estimate", dest="estimate", action="store_true", help=argparse.SUPPRESS)
+    parser.set_defaults(estimate=True)
+    parser.add_argument("--env-hz", type=bounded(1.0, 500.0), default=ENV_HZ,
+                        help="how often the env vector is rebuilt from the estimate, as S-M-ICRL's env_hz "
+                             "(default: %(default)s)")
+    parser.add_argument("--calibration", type=Path, default=CALIBRATION_FILE,
+                        help="go2/calibrate.py's results (default: %(default)s)")
+    parser.add_argument("--no-calibration", action="store_true",
+                        help="drive the robot without a calibration, or despite its failed checks")
     parser.add_argument("--domain", type=int, help="DDS domain id (default: 0 with --robot, otherwise 1)")
     parser.add_argument("--log", type=Path, help="where to save the run (default: go2/logs/<time>.npz)")
     args = parser.parse_args()
+    if args.fill_height is not None or args.trajectory:
+        args.estimate = False  # constants were asked for, or there's no policy to feed
+    args.calibration_data = load_calibration(args.calibration)
     if (args.policy is None) == (args.trajectory is None):
         parser.error("give either a policy file or --trajectory FILE")
     if (args.rate is None) != (args.trajectory is None):
@@ -898,7 +1069,7 @@ def parse_args():
 def main():
     args = parse_args()
     signal.signal(signal.SIGALRM, _on_watchdog)
-    signal.signal(signal.SIGTERM, _on_terminate)
+    stop_on_hangup()
     env = flat_floor_env(args.probe_height)
     original_mode = None
     try:
@@ -910,7 +1081,8 @@ def main():
                 print(f"Trajectory OK: {args.trajectory}\n  {describe_trajectory(rows, args.rate)}", flush=True)
                 return 0
         else:
-            policy, digest = prepare_policy(args.policy, env, args.fill_height)
+            # With the estimate the policy may read 30:34; the check only needs them finite.
+            policy, digest = prepare_policy(args.policy, env, 0.27 if args.estimate else args.fill_height)
             if args.seconds is None:
                 args.seconds = 3.0
             if args.check:
@@ -923,8 +1095,14 @@ def main():
                         lambda elapsed, state: trajectory_target(rows, args.rate, elapsed))
             else:
                 start_yaw = read_state(monitor.msg).rpy[2]
-                dry_run(monitor, args.seconds, args.policy_hz, lambda elapsed, state: policy_target(
-                    policy, build_robot_state(state, start_yaw, args.fill_height), env))
+                estimator = BaseEstimator(calibration=estimator_calibration(args.calibration_data))
+
+                def target_at(elapsed, state):
+                    estimate = (estimator.velocity, estimator.height) if args.estimate else None
+                    live = flat_floor_env(estimator.height) if args.estimate else env
+                    return policy_target(policy, build_robot_state(state, start_yaw, args.fill_height, estimate), live)
+
+                dry_run(monitor, args.seconds, args.policy_hz, target_at, estimator)
             return 0
         if args.robot:
             original_mode = prepare_robot(args, monitor, digest)
@@ -937,7 +1115,8 @@ def main():
 
     publisher = ChannelPublisher("rt/lowcmd", LowCmd_)
     publisher.Init()
-    controller = Controller(monitor, publisher, args.kp, args.kd, args.torque_fraction)
+    controller = Controller(monitor, publisher, args.kp, args.kd, args.torque_fraction,
+                            None if args.no_calibration else args.calibration_data)
     outcome = "finished"
     status = 0
     try:
@@ -946,7 +1125,8 @@ def main():
                 controller.play(rows, args.rate, args.seconds)
         else:
             def motion():
-                controller.walk(policy, env, args.policy_hz, args.seconds, args.fill_height)
+                controller.walk(policy, env, args.policy_hz, args.seconds, args.fill_height, args.estimate,
+                                args.env_hz)
         controller.run_sequence(motion, args.seconds, ask_before_walking=bool(args.robot))
     except Fault as fault:
         outcome, status = f"FAULT: {fault}", 1
@@ -958,8 +1138,7 @@ def main():
     finally:
         # Nothing may interrupt damping now.
         arm_watchdog(0.0)
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        ignore_stop_signals()
         try:
             controller.damp()
         except Exception:
@@ -972,7 +1151,9 @@ def main():
         "trajectory": args.trajectory and str(args.trajectory), "rate": args.rate, "sha256": digest, "outcome": outcome, "interface": args.robot or "lo",
         "policy_hz": args.policy_hz, "kp": args.kp, "kd": args.kd, "seconds": args.seconds,
         "torque_fraction": args.torque_fraction, "probe_height": args.probe_height,
-        "fill_height": args.fill_height,
+        "fill_height": args.fill_height, "estimate": args.estimate, "env_hz": args.env_hz,
+        "calibration": None if args.no_calibration else args.calibration_data,
+        "inputs_30_33": "estimator" if args.estimate else ("constants" if args.fill_height is not None else "none"),
         "original_mode": original_mode,
         # "t" counts from this time.perf_counter() reading, so other programs' times,
         # such as go2/phone_camera.py's, can be matched to the log.

@@ -42,6 +42,9 @@ parser.add_argument("--box", action="store_true",
                     help="add a 10 cm box ahead and to the left of the robot, like the README's lidar test")
 parser.add_argument("--crate", type=float, metavar="DEG",
                     help="add push_box_turn's 0.45 m crate, fixed, 2 m from the robot at this bearing (+ = left)")
+parser.add_argument("--hang", action="store_true",
+                    help="weld the body in the air at the model's start pose, feet clear, like the robot "
+                         "in a harness, for go2/sysid.py hang")
 args = parser.parse_args()
 if args.lidar and args.odom:
     parser.error("--lidar already publishes rt/utlidar/robot_odom, so leave out --odom")
@@ -66,8 +69,12 @@ from unitree_sdk2py_bridge import UnitreeSdk2Bridge  # noqa: E402
 
 BOX_NAME = "lidar_test_box"
 CRATE_NAME = "push_box_crate"
-if args.box or args.crate is not None:
+if args.box or args.crate is not None or args.hang:
     spec = mujoco.MjSpec.from_file(str(scene))
+    if args.hang:
+        # A weld to the world. Only resetting the base pose each step would let the robot
+        # free-fall during the step, and the legs would feel no gravity.
+        spec.add_equality(type=mujoco.mjtEq.mjEQ_WELD, objtype=mujoco.mjtObj.mjOBJ_BODY, name1="base_link")
     if args.box:
         spec.worldbody.add_geom(name=BOX_NAME, type=mujoco.mjtGeom.mjGEOM_BOX, pos=[0.45, 0.25, 0.05],
                                 size=[0.10, 0.20, 0.05], rgba=[0.8, 0.4, 0.2, 1.0])
@@ -92,6 +99,18 @@ if args.flat:
 data = mujoco.MjData(model)
 mujoco.mj_resetDataKeyframe(model, data, model.key("home").id)
 data.ctrl[:] = 0.0  # the keyframe's ctrl holds joint angles, but these are torque motors
+HANG_POSE = model.qpos0[:7].copy() if args.hang else None  # where the weld holds the base
+
+
+def pin_body():
+    """With --hang, undo the weld's small give, so only the legs move."""
+    if HANG_POSE is not None:
+        data.qpos[:7] = HANG_POSE
+        data.qvel[:6] = 0.0
+
+
+pin_body()
+mujoco.mj_forward(model, data)
 
 STATE_PERIOD = 0.005  # s, rt/lowstate and rt/sportmodestate
 ChannelFactoryInitialize(args.domain, "lo")
@@ -178,6 +197,7 @@ try:
     while not args.duration or time.perf_counter() - start < args.duration:
         step_start = time.perf_counter()
         mujoco.mj_step(model, data)
+        pin_body()
         if lidar is not None:
             lidar.step()
         if video_poses is not None and data.time * VIDEO_FPS >= len(video_poses):
