@@ -34,6 +34,8 @@ class Channel:
     " internal class __Reader
     """
     class __Reader:
+        __TAKE_BATCH = 64  # samples taken from DDS per read
+
         def __init__(self):
             self.__reader = None
             self.__handler = None
@@ -82,32 +84,39 @@ class Channel:
                 self.__threadReader.join()
 
         def __OnDataAvailable(self, reader: DataReader):
-            samples = []
-            try:
-                samples = reader.take(1)
-            except DDSException as e:
-                print("[Reader] catch DDSException error. msg:", e.msg)
-                return
-            except TimeoutError as e:
-                print("[Reader] take sample timeout")
-                return
-            except:
-                print("[Reader] take sample error")
-                return
+            # Take everything that is waiting, oldest first. This used to take one sample per
+            # call. DDS can raise this callback once for several arrivals, for example while
+            # the Python thread it needs is busy, and each time that happened one more sample
+            # was left queued. The handler then got samples that were seconds old.
+            while True:
+                try:
+                    samples = reader.take(self.__TAKE_BATCH)
+                except DDSException as e:
+                    print("[Reader] catch DDSException error. msg:", e.msg)
+                    return
+                except TimeoutError as e:
+                    print("[Reader] take sample timeout")
+                    return
+                except:
+                    print("[Reader] take sample error")
+                    return
 
-            if samples is None:
-                return
+                if not samples:
+                    return
 
-            # check invalid sample        
-            sample = samples[0]
-            if isinstance(sample, InvalidSample):
-                return
+                for sample in samples:
+                    # check invalid sample
+                    if isinstance(sample, InvalidSample):
+                        continue
 
-            # do sample
-            if self.__queueEnable:
-                self.__queue.Put(sample)
-            else:
-                self.__handler(sample)
+                    # do sample
+                    if self.__queueEnable:
+                        self.__queue.Put(sample)
+                    else:
+                        self.__handler(sample)
+
+                if len(samples) < self.__TAKE_BATCH:
+                    return
 
         def __ChannelReaderThreadFunc(self):
             while not self.__threadEvent.is_set():

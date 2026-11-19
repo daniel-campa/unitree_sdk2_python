@@ -38,6 +38,7 @@ import argparse
 import builtins
 import hashlib
 import json
+import math
 import os
 import select
 import signal
@@ -158,15 +159,49 @@ class Fault(Exception):
 
 
 class StateMonitor:
-    """Keep the latest rt/lowstate message and when it arrived."""
+    """Keep the latest rt/lowstate message, when it arrived, and how late it arrived.
+
+    A message can sit in a queue before it gets here, so its arrival time doesn't say how
+    old it is. The robot stamps each one with its own clock (tick, in ms). The smallest
+    gap seen between that clock and ours is a message that came straight through, and
+    `delay` is how much longer than that the latest one took. The smallest gap is taken
+    over the last one to two DELAY_WINDOW_S, so a slow drift between the two clocks
+    doesn't build up. Without a tick that advances (the simulator sends 0), delay is 0.
+    """
+
+    DELAY_WINDOW_S = 60.0
 
     def __init__(self):
         self.msg = None
         self.stamp = 0.0
+        self.delay = 0.0
+        self._tick = None
+        self._gaps = [math.inf, math.inf]  # smallest gap in the previous window, and in this one
+        self._window_end = 0.0
+
+    def note_arrival(self, msg, stamp):
+        tick = msg.tick
+        if self._tick is None or tick <= self._tick:  # the first message, or no usable tick
+            self._tick = tick
+            self.delay = 0.0
+            return
+        self._tick = tick
+        gap = stamp - tick / 1000.0
+        if stamp >= self._window_end:
+            self._gaps = [self._gaps[1], math.inf]
+            self._window_end = stamp + self.DELAY_WINDOW_S
+        self._gaps[1] = min(self._gaps[1], gap)
+        self.delay = max(0.0, gap - min(self._gaps))
+
+    def age(self):
+        """Seconds since the latest state was measured on the robot."""
+        return time.perf_counter() - self.stamp + self.delay
 
     def __call__(self, msg):
+        stamp = time.perf_counter()
+        self.note_arrival(msg, stamp)
         self.msg = msg
-        self.stamp = time.perf_counter()
+        self.stamp = stamp
 
 
 class State(NamedTuple):
@@ -623,9 +658,9 @@ def dry_run(monitor, seconds, step_hz, target_at, estimator=None):
         elapsed = time.perf_counter() - start
         if elapsed >= seconds:
             return
-        age = time.perf_counter() - monitor.stamp
+        age = monitor.age()
         if age > MAX_STATE_AGE:
-            raise Fault(f"no robot state for {age * 1000:.0f} ms")
+            raise Fault(f"the newest robot state is {age * 1000:.0f} ms old")
         state = read_state(monitor.msg)
         if estimator is not None:
             estimator.update(monitor.stamp, state.q, state.dq, state.quaternion, state.gyro, state.accel,
@@ -660,6 +695,7 @@ class Controller:
         self.clock_start = time.perf_counter()
         self.worst_overrun = 0.0
         self.worst_state_age = 0.0
+        self.max_state_age = MAX_STATE_AGE
         self.policy_calls = self.target_changes = 0
         self.worst_policy_time = 0.0
         self.calls = []  # (t, robot_state, target, state age, env, gains) per policy call, for go2/diagnose.py
@@ -679,9 +715,10 @@ class Controller:
             motor.dq = 0.0  # VEL_STOP with kd > 0 would ask for a huge torque in the simulator
 
     def latest_state(self, check_range):
-        age = time.perf_counter() - self.monitor.stamp
-        if age > MAX_STATE_AGE:
-            raise Fault(f"no robot state for {age * 1000:.0f} ms")
+        age = self.monitor.age()
+        if age > self.max_state_age:
+            raise Fault(f"the newest robot state is {age * 1000:.0f} ms old "
+                        f"({self.monitor.delay * 1000:.0f} ms of that waiting to be read)")
         self.worst_state_age = max(self.worst_state_age, age)
         state = read_state(self.monitor.msg)
         problem = safety_problem(state, check_range)
@@ -711,7 +748,7 @@ class Controller:
             time.perf_counter() - self.clock_start, stage, state.q, state.dq, target, q_cmd,
             state.tau_est, state.temperature, state.rpy, state.gyro, state.accel,
             state.foot_force, state.power_v, state.power_a,
-            state.tick, time.perf_counter() - self.monitor.stamp, state.quaternion, state.imu_rpy,
+            state.tick, self.monitor.age(), state.quaternion, state.imu_rpy,
             state.foot_force_est, state.ddq, state.lost, state.battery,
             estimate[0], estimate[1], self.estimator.weight.copy(), robot_state,
         ))
@@ -805,7 +842,8 @@ class Controller:
                 self.worst_policy_time = max(self.worst_policy_time, time.perf_counter() - call_start)
                 new_target = gains_target(gains, live_env)
                 self.calls.append((call_start - self.clock_start, robot_state, new_target,
-                                   call_start - self.monitor.stamp, live_env.copy(), gains.copy()))
+                                   call_start - self.monitor.stamp + self.monitor.delay, live_env.copy(),
+                                   gains.copy()))
                 if target is not None and np.abs(new_target - target).max() > 0.1:
                     self.target_changes += 1
                 self.policy_calls += 1
@@ -1047,6 +1085,9 @@ def parse_args():
     parser.add_argument("--env-hz", type=bounded(1.0, 500.0), default=ENV_HZ,
                         help="how often the env vector is rebuilt from the estimate, as S-M-ICRL's env_hz "
                              "(default: %(default)s)")
+    parser.add_argument("--max-state-age", type=bounded(0.02, 1.0), default=MAX_STATE_AGE,
+                        help="stop if the newest robot state is older than this many seconds, by the "
+                             "robot's own clock (default: %(default)s)")
     parser.add_argument("--calibration", type=Path, default=CALIBRATION_FILE,
                         help="go2/calibrate.py's results (default: %(default)s)")
     parser.add_argument("--no-calibration", action="store_true",
@@ -1117,6 +1158,7 @@ def main():
     publisher.Init()
     controller = Controller(monitor, publisher, args.kp, args.kd, args.torque_fraction,
                             None if args.no_calibration else args.calibration_data)
+    controller.max_state_age = args.max_state_age
     outcome = "finished"
     status = 0
     try:
@@ -1150,7 +1192,8 @@ def main():
         "policy": args.policy and str(args.policy),
         "trajectory": args.trajectory and str(args.trajectory), "rate": args.rate, "sha256": digest, "outcome": outcome, "interface": args.robot or "lo",
         "policy_hz": args.policy_hz, "kp": args.kp, "kd": args.kd, "seconds": args.seconds,
-        "torque_fraction": args.torque_fraction, "probe_height": args.probe_height,
+        "torque_fraction": args.torque_fraction, "max_state_age": args.max_state_age,
+        "probe_height": args.probe_height,
         "fill_height": args.fill_height, "estimate": args.estimate, "env_hz": args.env_hz,
         "calibration": None if args.no_calibration else args.calibration_data,
         "inputs_30_33": "estimator" if args.estimate else ("constants" if args.fill_height is not None else "none"),

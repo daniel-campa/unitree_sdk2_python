@@ -252,7 +252,7 @@ In S-M-ICRL, with robot-like sensor noise and foot force sensors of unknown gain
 | Watcher status shows `no force` | The foot force sensors aren't varying, so the estimator uses foot height instead. Note it and carry on. |
 | Watcher says `nothing recorded` | It was started after the run, or on a different interface. Start it first next time. |
 | Watcher keeps warning `latency ... ms` | Note it. That is the main thing being looked for, so keep going. |
-| `no robot state for ... ms` fault | The cable or the computer stalled. Check the cable, and close other heavy programs. |
+| `the newest robot state is ... ms old` fault | The state the script is reading is more than 100 ms old, measured against the robot's own clock. Either messages stopped arriving (check the cable) or the computer fell behind reading them (close other heavy programs). Keep the log and note the message. |
 | Connection problems | README "If something fails". |
 | The SSH connection dropped | SSH in again and run `tmux attach -t go2`. Everything carried on. Without tmux, the run stopped and damped, and `go2/logs/hangup.log` says when. |
 | Sport mode is gone after a run | Expected. Restart the robot to get it back. |

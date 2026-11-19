@@ -196,6 +196,7 @@ class ArrivalMonitor(rp.StateMonitor):
 
     def __call__(self, msg):
         stamp = time.perf_counter()
+        self.note_arrival(msg, stamp)
         self.msg, self.stamp = msg, stamp
         self.arrivals.append((stamp, msg.tick))
         if self.states is not None:
