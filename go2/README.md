@@ -2,7 +2,7 @@
 
 Follow these steps on the Ubuntu computer wired to the robot. They end with a read-only check that sends no commands to the robot.
 
-**Don't run other scripts yet.** Unitree's examples can move the robot as soon as you give them a network interface. `stand_test.py` only works with the simulator, so it can't reach the robot. `run_policy.py` only reaches the robot if you pass `--robot`, and [Run a policy](#run-a-policy) covers when to do that. `check_lidar.py`, `lidar_map.py` and `push_box_map.py` are also read-only, and [Check the lidar](#check-the-lidar) covers them. So is `check_odom.py`, which [Check the odometry](#check-the-odometry) covers. `phone_camera.py` never talks to the robot, and [Film with a phone](#film-with-a-phone) covers it. `tag_tracker.py` and `make_tag_sheets.py` only read videos and write files, and [Measure the walk with AprilTags](#measure-the-walk-with-apriltags) covers them. `watch.py` is read-only too, and [Diagnose a failed transfer](#diagnose-a-failed-transfer) covers it with `diagnose.py`. `sysid.py passive` is read-only, but `sysid.py hang` and `sysid.py stand` move the robot, and [Measure the robot for the simulator](#measure-the-robot-for-the-simulator) covers them. `calibrate.py` runs these and the input check in order before a session, and says before each step whether it moves the robot. [ROBOT_SESSION.md](ROBOT_SESSION.md) covers it.
+**Don't run other scripts yet.** Unitree's examples can move the robot as soon as you give them a network interface. `stand_test.py` only works with the simulator, so it can't reach the robot. `run_policy.py` only reaches the robot if you pass `--robot`, and [Run a policy](#run-a-policy) covers when to do that. `check_lidar.py`, `lidar_map.py` and `push_box_map.py` are also read-only, and [Check the lidar](#check-the-lidar) covers them. So is `check_odom.py`, which [Check the odometry](#check-the-odometry) covers. `phone_camera.py` never talks to the robot, and [Film with a phone](#film-with-a-phone) covers it. `tag_tracker.py` and `make_tag_sheets.py` only read videos and write files, and [Measure the walk with AprilTags](#measure-the-walk-with-apriltags) covers them. `watch.py` is read-only too, and [Diagnose a failed transfer](#diagnose-a-failed-transfer) covers it with `diagnose.py`. So is `record_walk.py record`, which [Record a sport-mode walk](#record-a-sport-mode-walk) covers. `sysid.py passive` is read-only, but `sysid.py hang` and `sysid.py stand` move the robot, and [Measure the robot for the simulator](#measure-the-robot-for-the-simulator) covers them. `calibrate.py` runs these and the input check in order before a session, and says before each step whether it moves the robot. [ROBOT_SESSION.md](ROBOT_SESSION.md) covers it.
 
 ## 1. Install
 
@@ -415,6 +415,82 @@ python go2/diagnose.py inputs go2/logs/watch/<time>.npz
 ```
 
 It compares each of the 37 inputs with a second source: the joint angles' rate, the IMU's own rpy, the quaternion's rate, gravity in the accelerometer, Unitree's foot positions, and sport mode's velocity and height for the `--estimate` values. [ROBOT_SESSION.md](ROBOT_SESSION.md) has the full session plan and a table of what each input is on the robot.
+
+## Record a sport-mode walk
+
+`record_walk.py` records the robot while you walk it in sport mode, and rebuilds the motion afterwards: as a video of the Go2 model going through it, as a joint file that `run_policy.py --trajectory` can play, and as a CSV. Recording is read-only. It only subscribes to topics, so the robot moves only when you move it, with the remote or the app.
+
+**The recorder hasn't been tried on the robot yet.** It has recorded a stand-in robot on the loopback interface that published the same three topics. What it rebuilt matched what the stand-in sent: joint angles within 0.2 mrad and the body's path within 0.2 mm, also while the recorder's computer was kept busy. `info`, `replay` and `export` have been run on a real sport-mode walk, the calibration's remote walk of 2026-11-19 (`go2/logs/calibration/<time>/input_walk.npz`). That is a `watch.py` recording, which they also read.
+
+### 1. Record
+
+Do sections 1-4 first, so `$IFACE` is set. With the robot standing in sport mode:
+
+```bash
+python go2/record_walk.py record --robot "$IFACE" --note "slow walk forward, 2 m"
+```
+
+Walk the robot, then press Ctrl-C. It saves `go2/logs/walks/<time>.npz` and prints what's in it. A closed terminal saves it too. It stops by itself after 10 minutes (`--seconds`), because the recording is held in memory until it's saved, at about 40 MB a minute.
+
+Each second it prints the message rates, how far the robot is from where it started, its speed, and the remote's sticks. On 2026-11-19 the robot sent `state` at 500 Hz and `sport` at 300 Hz.
+
+| It records | From |
+|---|---|
+| Joint angles, speeds, torques and temperatures, the IMU, foot force, battery, and the remote's sticks and buttons | `rt/lowstate` |
+| Sport mode's body position, velocity, yaw rate, attitude, mode and gait | `rt/sportmodestate` |
+| The joint targets and gains sport mode sends its motors | `rt/lowcmd` |
+
+On 2026-11-19, sport mode's commands were plain position targets with kp 40 and kd 1, no feed-forward torque, changing 50 times a second.
+
+Each message is timed by a clock on the robot (the state's `tick`, sport mode's stamp, the time DDS sent a command), not by when this computer read it. So a busy computer doesn't smear the recording.
+
+| Message | What it means |
+|---|---|
+| `no rt/sportmodestate` | Sport mode is off, so the body's position isn't recorded. The joints and IMU still are. |
+| `... ms behind the robot` | This computer is busy. The recording is still right, but past 8 s behind, messages are lost. Close other programs. |
+| `No rt/lowstate ...` | See [If something fails](#if-something-fails). |
+
+### 2. See what's in it
+
+```bash
+python go2/record_walk.py info go2/logs/walks/<time>.npz
+```
+
+It prints the rates, how many states were lost, and a table of the stretches where the robot was moving: when, how far forward and left, how much it turned. Those times go into `--start` and `--end` below.
+
+### 3. Rebuild the motion
+
+```bash
+python go2/record_walk.py replay go2/logs/walks/<time>.npz --start 12 --end 20 --video walk.mp4
+python go2/record_walk.py export go2/logs/walks/<time>.npz --start 12 --end 20
+```
+
+These don't need the SDK, only numpy, so they also run on another computer. `replay` also needs MuJoCo, OpenCV and a Go2 model: `go2/setup_env.sh --with-sim` installs them, and `--scene` points it at another `scene.xml`, such as S-M-ICRL's `Robots/go2/scene.xml`.
+
+How the motion is rebuilt:
+
+- **Frame:** the start of the stretch is the origin, facing +x, with y to the left.
+- **Body position and attitude:** sport mode's own. Its yaw is used, not the raw IMU's, because its position goes with it: on 2026-11-19 the two were 0.15 rad apart and drifting.
+- **Height:** Unitree doesn't say which point of the body its height is for, so one shift for the whole stretch stands the lowest foot on the floor. On 2026-11-19 it was +29 mm, and the feet then stayed within 3 mm rms of the floor.
+- **Joints:** from `rt/lowstate`, interpolated onto an even clock. The output says how much of a stretch falls in holes where messages were lost.
+- **Without sport mode** (a `watch.py` recording of a policy run, for example): the body's position is worked out from the legs and IMU by `state_estimator.py`. On the 2026-11-19 walk that read 9-13% longer than sport mode's own position.
+
+`replay` poses the model as recorded and films it. Nothing is simulated, so it shows what the robot did, not what a simulator would do. `--speed 0.25` gives slow motion. **It has only been rendered on a Mac**, not on the robot computer, where it uses the same offscreen rendering as `sim_headless.py --video`.
+
+`export` writes two files next to the recording:
+
+- `<recording>_trajectory.txt`: the joint angles at `--rate` (default 50 Hz), in the format [Play back a joint trajectory](#play-back-a-joint-trajectory) takes. `--source commanded` writes the targets sport mode sent instead of the angles the joints reached. It runs `run_policy.py`'s own check on the file and prints the command that plays it.
+- `<recording>_motion.csv`: one row per sample with `t`, the base's `x y z` and `qw qx qy qz`, `yaw`, each joint's angle (`FR_hip_q`, ...) and speed (`_dq`), the velocity along the body's own axes, `yaw_rate`, the four foot forces, sport mode's targets (`_cmd`) and the sticks.
+
+**A playback is open loop.** Sport mode balances with feedback and a playback doesn't, so it won't repeat the walk exactly. In plain MuJoCo physics with S-M-ICRL's Go2 model, three stretches of the 2026-11-19 walk were played the way `run_policy.py` plays a file:
+
+| Stretch | Recorded | Measured angles, kp 80, kd 4 | Commanded targets, kp 40, kd 1 |
+|---|---|---|---|
+| Fast forward, 2.6 s | 1.59 m | 1.42 m, upright | fell at 1.5 s |
+| Slow forward, 3.9 s | 1.13 m | 0.75 m, upright | 1.42 m, upright |
+| Sideways, 2.3 s | 0.88 m | 0.31 m, upright | 1.03 m, upright |
+
+**No exported file has been played through `run_policy.py` yet**, in `sim_headless.py` or on the robot. Sport mode's targets jump by about 0.14 rad every 20 ms. `run_policy.py` refuses a file that asks for more speed than its speed fault allows, so it refuses some commanded stretches, and `export` says when. On the robot, follow the stages in [Test on the robot](#test-on-the-robot) with the playback command in place of the walk one.
 
 ## Check the odometry
 
