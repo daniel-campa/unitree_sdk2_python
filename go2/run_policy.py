@@ -104,7 +104,7 @@ MAX_LOOP_STALL = 0.2  # s
 MAX_STAND_ERROR = 0.2  # rad; kp = 80 sags the rear hips by about 0.12 rad
 MAX_STAND_TILT = 0.2  # rad
 MAX_STAND_SPEED = 0.5  # rad/s
-MIN_BATTERY_PERCENT = 15
+MIN_BATTERY_PERCENT = 5
 
 STOP_BUTTON_MASK = 1 << 1  # B, in wireless_remote[3]; see example/wireless_controller
 POS_STOP, VEL_STOP = 2.146e9, 16000.0  # values that disable a motor's control loops
