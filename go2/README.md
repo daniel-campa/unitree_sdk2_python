@@ -129,7 +129,7 @@ python go2/check_lidar.py "$IFACE" | tee lidar_check.txt
 1. **Flat floor, standing.** Every beam should read about the same height, and the three differences should be near 0. `spread` should be small compared with the 0.30 m an edge produces.
 2. **Low box on the left.** Stand a box about 10 cm high in front of the robot, covering 0.35-0.55 m ahead and 0.05-0.45 m left of the centreline. The three differences should read about +0.10. A negative value means left and right are swapped.
 3. **Raised edge, if you have one.** Stand the robot on a stable raised surface with the drop close on one side, and keep someone next to it. A lidar can't see the floor just past a raised edge, so those beams may show `--` instead of the -0.57 they read in simulation. A `FAIL` here is a useful result, so note which beams have data.
-4. **Sport mode off.** Sport mode stays off after stage 2 of [Test on the robot](#test-on-the-robot) until you restart the robot. Run the check again then, to see which topics still publish. The robot is lying down by that point, so only the rates and `valid %` mean anything.
+4. **Sport mode off.** Run stage 2 of [Test on the robot](#test-on-the-robot) with `--leave-sport-off`, so sport mode stays off afterward. Run the check again then, to see which topics still publish. The robot is lying down by that point, so only the rates and `valid %` mean anything.
 
 | Message | What it means |
 |---|---|
@@ -332,7 +332,7 @@ These go straight to damping, which lets the robot sink to the ground:
 
 The script aims to keep torque within 80% of the limits (`--torque-fraction`). Peaks can go above that. At the old 60% default the thigh reached about 21 N·m in simulation, against a 14 N·m target and a 23.7 N·m limit. On the robot, 60% held the thighs back for about half of each walk, so they often didn't finish a swing before the next policy call and the gait staggered. The 80% default hasn't been tried in simulation or on the robot yet. Expect thigh peaks at the 23.7 N·m limit, where the motor saturates.
 
-Each run saves its data to `go2/logs/<time>.npz`, including `rt/utlidar/robot_odom` when it publishes. Sport mode stays off after a run, so restart the robot to get it back.
+Each run saves its data to `go2/logs/<time>.npz`, including `rt/utlidar/robot_odom` when it publishes. After a run that finishes, `run_policy.py` switches sport mode back on, to the mode the robot was in (`--sport-mode` names it if the robot was already in low-level mode). The robot may move when it does. After a stop or a fault it asks first; press Enter to switch it on, or type `n`. `--leave-sport-off` skips this. If it reports that sport mode didn't come back, use the app or restart the robot. This hasn't been tried on the robot yet.
 
 ## Check the odometry
 
@@ -350,7 +350,7 @@ It takes you through five steps, waiting for Enter between them:
 |---|---|---|
 | 1. Still, sport mode on | Leave the robot standing as it is after start-up, and stand back for 20 s | the noise with sport mode running |
 | 2. Remote walk (optional) | Walk it about 1 m forward with the remote | accuracy with sport mode's own estimator running |
-| 3. Policy walk | Run `run_policy.py --robot` in the other terminal | whether each topic survives sport mode being released and follows a low-level walk |
+| 3. Policy walk | Run `run_policy.py --robot --leave-sport-off` in the other terminal | whether each topic survives sport mode being released and follows a low-level walk |
 | 4. Moved by hand (optional) | Slide or carry it about 1 m forward, holding the body | whether each topic follows the robot when no legs are stepping |
 | 5. Still, sport mode off | Stand back for 20 s | the noise after the release |
 
