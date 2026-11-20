@@ -51,6 +51,7 @@ POLL_PERIOD = 0.004  # s between collections of the messages that have arrived
 DEPTH = 4000  # messages a topic keeps between collections: 8 s of rt/lowstate
 WINDOW = 2.0  # s of data behind each status line
 BEHIND_WARN_MS = 250.0  # warn when the newest state collected is older than this
+LOCAL_CLOCK_S = 0.5  # a sender whose clock is this close to this computer's runs on this computer
 IDLE_STOP = 3.0  # s without commands, after some arrived, before saving
 SAT_SHARE = 0.95
 LIVE_FIT_R2 = 0.9  # show a live latency only when the fit explains this much of the torque
@@ -88,20 +89,26 @@ class Stream:
     had (see run_policy.StateMonitor). DDS keeps up to DEPTH messages between calls, so
     none are lost while this program is busy.
 
-    A row starts with the sender's clock, in seconds: the robot's tick for rt/lowstate,
-    DDS's send time for the others. `offset` turns that into this computer's
-    time.perf_counter(): it is the smallest gap seen between the two clocks, so the
-    fastest delivery counts as no delay. perf_counter is CLOCK_MONOTONIC on Linux, shared
-    by every process, so the times line up with run_policy.py's log (its meta
-    "clock_start" is on the same clock). A topic that gives no send time is stamped with
-    the time of collection instead.
+    A row starts with its sender's clock, in seconds: the robot's tick for rt/lowstate,
+    DDS's send time for the others. times() turns that into this computer's
+    time.perf_counter() by adding the smallest gap seen between the two clocks, so the
+    fastest delivery counts as no delay. Each sender has its own gap, because a topic can
+    have senders with different clocks: rt/lowcmd comes from the robot while sport mode
+    is on and from run_policy.py on this computer during a run. perf_counter is
+    CLOCK_MONOTONIC on Linux, shared by every process, so the times line up with
+    run_policy.py's log (its meta "clock_start" is on the same clock). A message with no
+    send time is stamped with the time of collection instead.
     """
 
     def __init__(self, topic, kind, extract, sender_time=source_time):
         self.rows = []
-        self.sent = []  # each row's first element, for searching by time
-        self.offset = 0.0
-        self._gap = None
+        self.sent = []  # each row's first element
+        self.writers = []  # each row's sender
+        self.local = []  # whether each row's sender runs on this computer's clock
+        self.newest_local = None  # the newest such row's time, as a time.perf_counter() reading
+        self._at = []  # each row's time.perf_counter() time as known when it was collected, never decreasing
+        self._gaps = {}  # sender -> smallest (collection time - send time) seen
+        self._local = {}  # sender -> whether its clock is this computer's
         self._extract = extract
         self._sender_time = sender_time
         self._subscriber = ChannelSubscriber(topic, kind)
@@ -110,29 +117,52 @@ class Stream:
     def poll(self):
         now = time.perf_counter()
         for msg in self._subscriber.ReadAll():
-            sent = self._sender_time(msg) if self._gap != 0.0 else None
-            if sent is None:  # no send time on this topic: use the time of collection
-                sent, self._gap = now, 0.0
-            elif self._gap is None or now - sent < self._gap:
-                self._gap = now - sent
-            self.offset = self._gap
+            writer = getattr(getattr(msg, "sample_info", None), "publication_handle", 0)
+            sent = self._sender_time(msg)
+            if sent is None:  # no send time: use the time of collection
+                sent, writer = now, None
+            gap = now - sent if writer is not None else 0.0
+            if writer not in self._gaps:
+                self._gaps[writer] = gap
+                # A sender on this computer stamps with this computer's wall clock.
+                self._local[writer] = (self._sender_time is source_time and writer is not None
+                                       and abs(gap - (now - time.time())) < LOCAL_CLOCK_S)
+            elif gap < self._gaps[writer]:
+                self._gaps[writer] = gap
+            at = sent + self._gaps[writer]
+            if self._at and at < self._at[-1]:
+                at = self._at[-1]
+            if self._local[writer]:
+                self.newest_local = at
             self.sent.append(sent)
+            self.writers.append(writer)
+            self.local.append(self._local[writer])
+            self._at.append(at)
             self.rows.append((sent,) + self._extract(msg))
 
     def since_index(self, i):
         return self.rows[i:]
 
-    def since(self, t0):
-        """Rows sent at or after t0, a time.perf_counter() reading."""
-        return self.rows[bisect.bisect_left(self.sent, t0 - self.offset):]
+    def times(self, start=0):
+        """The send times of rows[start:], as time.perf_counter() readings."""
+        gaps = np.array([self._gaps[w] for w in self.writers[start:]])
+        return np.array(self.sent[start:]) + gaps
 
-    def times(self, rows):
-        """These rows' send times as time.perf_counter() readings."""
-        return np.array([r[0] for r in rows]) + self.offset
+    def window(self, t0, prefer_local=False):
+        """The rows sent at or after t0 (a time.perf_counter() reading), and their times.
+
+        With prefer_local, only the rows sent from this computer, if there are any.
+        """
+        i = bisect.bisect_left(self._at, t0)
+        rows, times = self.rows[i:], self.times(i)
+        if prefer_local and any(self.local[i:]):
+            keep = np.array(self.local[i:])
+            rows, times = [r for r, k in zip(rows, keep) if k], times[keep]
+        return rows, times
 
     def newest(self):
-        """The newest row's send time as a time.perf_counter() reading, or None."""
-        return self.sent[-1] + self.offset if self.sent else None
+        """The newest row's time as a time.perf_counter() reading, or None."""
+        return self._at[-1] if self._at else None
 
     def __len__(self):
         return len(self.rows)
@@ -331,8 +361,11 @@ def usage_summary(data, system):
         return out
     sel = np.ones(len(t), dtype=bool)
     if "cmd_t" in data and len(data["cmd_t"]):
-        sel = (t >= data["cmd_t"][0]) & (t <= data["cmd_t"][-1])  # while commands came
-        out["commanded_s"] = round(float(data["cmd_t"][-1] - data["cmd_t"][0]), 2)
+        cmd_t = data["cmd_t"]
+        if data.get("cmd_local") is not None and data["cmd_local"].any():
+            cmd_t = cmd_t[data["cmd_local"]]  # the run's commands, not sport mode's
+        sel = (t >= cmd_t[0]) & (t <= cmd_t[-1])  # while commands came
+        out["commanded_s"] = round(float(cmd_t[-1] - cmd_t[0]), 2)
     ts = t[sel]
     if ts.size < 2:
         return out
@@ -400,7 +433,7 @@ def columns(stream, fields, prefix):
     rows = stream.rows
     if not rows:
         return {}
-    out = {f"{prefix}_t": stream.times(rows)}
+    out = {f"{prefix}_t": stream.times()}
     for i, name in enumerate(fields, start=1):
         out[f"{prefix}_{name}"] = np.array([r[i] for r in rows])
     return out
@@ -464,12 +497,11 @@ def _scale(delay, idx, cmd_t, cmd_q, cmd_kp, cmd_kd, st_t, q, dq, tau, edge=0.00
 def status(state, cmd, now, latency_warn, derived):
     """One status line, and the warnings that go with it."""
     warnings = []
-    s = state.since(now - WINDOW)
-    c = cmd.since(now - WINDOW)
+    s, st_t = state.window(now - WINDOW)
+    c, cmd_t = cmd.window(now - WINDOW, prefer_local=True)  # a run's commands, not sport mode's
     parts = []
     if len(s) < 2:
         return "no rt/lowstate", ["NO STATE: is the robot connected?"]
-    st_t = state.times(s)
     gaps = np.diff(st_t) * 1000.0
     parts.append(f"state {len(s) / WINDOW:4.0f} Hz (gap max {gaps.max():5.1f} ms)")
     if gaps.max() > STATE_GAP_WARN_MS:
@@ -488,7 +520,6 @@ def status(state, cmd, now, latency_warn, derived):
     sat = 100.0 * np.mean(np.abs(tau) >= SAT_SHARE * TORQUE_LIMIT)
     current = np.mean([r[11] for r in s])
     if c:
-        cmd_t = cmd.times(c)
         cgaps = np.diff(cmd_t) * 1000.0 if len(c) > 1 else np.array([0.0])
         parts.append(f"cmd {len(c) / WINDOW:4.0f} Hz (gap max {cgaps.max():5.1f} ms)")
         if cgaps.max() > CMD_GAP_WARN_MS:
@@ -572,7 +603,6 @@ def main():
     print(f"Watching {interface}, domain {domain}. Read-only: this publishes nothing. "
           f"Ctrl-C to stop and save.", flush=True)
     start = time.perf_counter()
-    seen_cmd = None
     warned = set()
     next_status = start + STATUS_PERIOD
     while not stop.wait(POLL_PERIOD):
@@ -592,8 +622,10 @@ def main():
             print(f"  WARNING: {w}", flush=True)
             warned.add(key)
         if len(cmd):
-            seen_cmd = seen_cmd or now
-            if not args.seconds and now - cmd.newest() > IDLE_STOP:
+            # A run's commands come from this computer. Sport mode's come from the robot and
+            # carry on after the run, now that run_policy.py switches sport mode back on.
+            last_cmd = cmd.newest_local if cmd.newest_local is not None else cmd.newest()
+            if not args.seconds and now - last_cmd > IDLE_STOP:
                 print("Commands stopped; saving.", flush=True)
                 break
         if args.seconds and now - start >= args.seconds:
@@ -609,6 +641,8 @@ def main():
     sys_columns = system.columns()
     data.update(sys_columns)
     data.update(columns(cmd, LOWCMD_FIELDS, "cmd"))
+    if len(cmd):
+        data["cmd_local"] = np.array(cmd.local)  # sent from this computer (a run), not by the robot (sport mode)
     data.update(columns(sport, SPORT_FIELDS, "sport"))
     data.update(columns(odom, ODOM_FIELDS, "odom"))
     if not data:

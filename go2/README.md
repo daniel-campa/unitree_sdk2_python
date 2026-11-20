@@ -201,6 +201,42 @@ Start the check about 3 s after `stand_test.py`, once the robot is standing. Wit
 
 **A PASS here says nothing about the real robot.** The simulated data has no noise, and its frames, scan pattern and lidar mount are assumptions. `rt/sportmodestate` always publishes in the simulator, so ignore the sport mode line too. The simulated lidar also slows the simulator by about 25%, so leave it off when testing policies.
 
+### Measure the lidar's mount, and give the policy the lidar's env vector
+
+S-M-ICRL gives every policy an env vector: three terrain probes 0.30 m ahead, the clearance overhead, the distance to the first thing in front, and a bias of 1 (`world/robot_api.py`, `_build_env_vector`). Until now `run_policy.py` always gave open, flat floor. `go2/lidar_env.py` builds the same vector from the lidar's point cloud, with S-M-ICRL's distances and ray angles. With the same scene and a known mount, it matches S-M-ICRL to within 2 cm, including with 2 cm of range noise. **None of this has run on the real robot yet.**
+
+To place a cloud that's in the lidar's own frame, `run_policy.py` needs to know where the lidar sits on the body. `lidar_calibrate.py` measures it. It's read-only and also runs as `calibrate.py`'s `lidar` step:
+
+```bash
+python go2/lidar_calibrate.py --robot "$IFACE" --wall-distance 1.0
+```
+
+Stand the robot still in sport mode on a flat, clear floor. Put a flat board, at least 0.6 m wide and 0.5 m tall, square to it and straight ahead. Its face should be 1.0 m from the robot's centre, measured on the floor midway between the front and rear feet. The script then works out:
+- from the floor: the lidar's roll, pitch and height
+- from the board: its forward position and whether it faces forward or back
+- for each lidar topic: rate, frame, fields and points
+- how close ahead it can see the floor
+
+It checks the result by building the env vector from every cloud. On flat floor the probes should read minus the body height, and `object_dist` should read the board's distance. Without the board, the forward position isn't measured.
+
+`run_policy.py` then reads the lidar on every run, in a process of its own (`go2/lidar_worker.py`), so the control loop never waits for a cloud:
+
+```bash
+python go2/run_policy.py POLICY.py --robot "$IFACE"                     # flat env as before; lidar recorded
+python go2/run_policy.py POLICY.py --robot "$IFACE" --env-source lidar  # the policy gets the lidar's env vector
+```
+
+- **Which vector the policy gets:** with the default `--env-source flat` the policy gets the same flat-floor vector as before. The lidar's vector is logged next to it (`env_given`, `env_lidar` in the run log).
+- **The readings file:** the lidar process writes `<log>_lidar.npz` beside the run log. It holds every cloud's arrival, frame and size, the env vector from every usable cloud, and a 4096-point subset of every cloud that arrived while walking.
+- **With `--env-source lidar`:** without a usable cloud the run refuses before releasing sport mode, or lies down without walking. If the cloud goes stale mid-walk (`--max-cloud-age`, 0.5 s), the run stops.
+- **Other tasks:** `--env-mode obstacle_bearing --probe-bearings 30,20,10,0,-10,-20,-30 --probe-range 4 --probe-sector 10` gives push_box_turn's layout.
+- **Turning it off:** `--no-lidar` doesn't read the lidar at all.
+
+After a run, `python go2/lidar_report.py go2/logs/<time>.npz` reads both files. It prints:
+- how many clouds came on each topic in each stage, before and after sport mode was released
+- the given and lidar env vectors while walking, column by column, with fallbacks and cloud age
+- the control loop's cycle times
+
 ## Run a policy
 
 `run_policy.py` runs a policy from S-M-ICRL, or plays back a recorded joint trajectory ([Play back a joint trajectory](#play-back-a-joint-trajectory)). It uses the simulator unless you pass `--robot`.

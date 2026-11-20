@@ -6,6 +6,9 @@ It takes you through each step, says what to do with the robot, and runs the tes
   connection  go2/check_connection.py: the link works and the state looks sane. Read-only.
   passive     go2/sysid.py passive: state rate, timing and sensor noise, IMU bias at rest.
               Read-only. Robot standing still in sport mode.
+  lidar       go2/lidar_calibrate.py: what the lidar sends, and where it sits on the body,
+              for --env-source lidar in go2/run_policy.py. Read-only. Robot standing still
+              in sport mode, a flat board square to it --lidar-wall-distance m ahead.
   inputs      go2/watch.py while you walk the robot with the remote in sport mode, then
               go2/diagnose.py's input check: each of the 37 policy inputs against a second
               source, and the velocity and height estimate against Unitree's own.
@@ -43,17 +46,22 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 CALIBRATION_DIR = HERE / "logs" / "calibration"
 LATEST = CALIBRATION_DIR / "latest.json"
-STEPS = ("connection", "passive", "inputs", "hang", "stand")
+STEPS = ("connection", "passive", "lidar", "inputs", "hang", "stand")
 INPUT_WALK_S = 120.0
 MAX_AGE_H = 24.0  # run_policy.py warns about an older calibration
 MIN_FORCE_SPAN = 5.0  # raw units between hanging and standing for a foot sensor to count as working
 # Inputs that must mean the same as in S-M-ICRL before any policy runs (diagnose.CORE_INPUT_CHECKS).
 CORE_INPUT_CHECKS = ("joint_angles", "joint_velocities", "rpy", "gyro", "gravity")
 LATENCY_OK_MS = 10.0  # the argon sweep: class_argon_walk is unaffected up to here
+LIDAR_WALL_DISTANCE = 1.0  # m from the robot's centre to the board's face, for the lidar step
 
 INSTRUCTIONS = {
     "connection": "Robot on, standing in sport mode after start-up, cable connected.",
     "passive": "Robot standing still in sport mode. Stand back and don't touch it for 10 s.",
+    "lidar": ("Robot standing still in sport mode on a flat, clear floor, nobody within 2 m. Stand a flat board "
+              "(at least 0.6 m wide, 0.5 m tall) square to the robot, straight ahead, its face the distance given "
+              "by --lidar-wall-distance (default 1.0 m) from the robot's centre: on the floor, midway between "
+              "the front and rear feet. Measure it with a tape. It records for 10 s."),
     "inputs": (f"Robot in sport mode, in the clear lane, remote in hand. When it starts, over "
                f"{INPUT_WALK_S:.0f} s: stand still 10 s; walk forward slowly about 2 m and back; "
                f"sideways about 1 m left and right; a half turn on the spot each way; then stand "
@@ -261,8 +269,22 @@ def step_stand(args, out):
                       "standing_height_m": None if height is None else round(height, 4)}}, None
 
 
-STEP_FUNCTIONS = {"connection": step_connection, "passive": step_passive, "inputs": step_inputs,
-                  "hang": step_hang, "stand": step_stand}
+def step_lidar(args, out):
+    log = out / "lidar.npz"
+    cmd = [sys.executable, HERE / "lidar_calibrate.py", *robot_args(args), "--log", log]
+    if args.lidar_wall_distance > 0:
+        cmd += ["--wall-distance", f"{args.lidar_wall_distance:g}"]
+    code = run(cmd)
+    report = log.with_suffix(".json")
+    if not report.exists():
+        return None, "lidar_calibrate.py saved nothing"
+    results = json.loads(report.read_text())["results"]
+    found = {"lidar": {"files": [str(log), str(report)], "results": results}, "lidar_mount": results.get("mount")}
+    return found, (None if code == 0 else "lidar_calibrate.py: " + "; ".join(results.get("summary", [])[:2]))
+
+
+STEP_FUNCTIONS = {"connection": step_connection, "passive": step_passive, "lidar": step_lidar,
+                  "inputs": step_inputs, "hang": step_hang, "stand": step_stand}
 
 
 # --------------------------------------------------------------------------- summary
@@ -312,6 +334,12 @@ def summary(cal):
         lines.append(f"Standing height (estimated): {cal['standing_height_m']:.3f} m (S-M-ICRL starts at 0.27)")
     if cal.get("recommended_policy"):
         lines.append(f"Run first (of the argon walks): {cal['recommended_policy']}")
+    lidar = (cal.get("lidar") or {}).get("results") or {}
+    if lidar:
+        mount = cal.get("lidar_mount")
+        lines.append("Lidar: " + (f"mount {mount['xyz']} m, rpy {mount['rpy']} rad in frame {mount['frame']!r}, "
+                                  f"measured {mount['measured']}" if mount else lidar.get("mount_note") or
+                                  "no mount (see the lidar step's summary)"))
     refuse, warn = calibration_problems(cal)
     missing = [s for s in ("inputs", "hang") if s not in (cal.get("steps") or {}) or cal["steps"][s].get("error")]
     if missing:
@@ -341,6 +369,9 @@ def parse_args():
                         help="comma-separated steps to run, in this order: %(default)s")
     parser.add_argument("--walk-seconds", type=float, default=INPUT_WALK_S,
                         help="how long the inputs step records (default: %(default)s)")
+    parser.add_argument("--lidar-wall-distance", type=float, default=LIDAR_WALL_DISTANCE, metavar="M",
+                        help="lidar step: the board's face is this far ahead of the robot's centre; 0 = no board "
+                             "(the lidar's forward position isn't measured then) (default: %(default)s)")
     parser.add_argument("--fresh", action="store_true", help="start a new calibration instead of updating latest.json")
     parser.add_argument("--show", action="store_true", help="print the current calibration's summary and exit")
     args = parser.parse_args()

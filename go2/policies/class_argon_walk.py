@@ -1,82 +1,85 @@
-def make_matrix(pose):
-    K = np.zeros((12, 6), dtype=float)
-    K[:, 5] = pose
-    return K
+k0 = np.zeros((12, 6))
+k1 = np.zeros((12, 6))
+k2 = np.zeros((12, 6))
+k3 = np.zeros((12, 6))
+k4 = np.zeros((12, 6))
+k5 = np.zeros((12, 6))
 
-# Joint order: FR(0,1,2), FL(3,4,5), RR(6,7,8), RL(9,10,11)
-# Home standing pose is [0.0, 0.9, -1.8] per leg.
+# Nominal swing: thigh 0.52, calf -2.13
+# Nominal stance: thigh 1.24, calf -1.51
 
-# Posture 0: FR+RL early swing (calf tucked), FL+RR early stance sweep & support
-# Drives d_pos toward 0.79 - 1.01 = -0.22 while calf tucks clear of ground
-pose_0 = [
-    0.0, 0.79, -2.34,  # FR: lift and swing forward
-    0.0, 1.01, -1.68,  # FL: stance sweep with firm calf support
-    0.0, 1.01, -1.68,  # RR: stance sweep with firm calf support
-    0.0, 0.79, -2.34   # RL: lift and swing forward
+# --- Straight pair (|heading_err| <= 0.015) ---
+# k0: FR+RL swing, FL+RR stance
+k0[:, 5] = [
+    0.0, 0.52, -2.13,  # FR (swing)
+    0.0, 1.24, -1.51,  # FL (stance)
+    0.0, 1.24, -1.51,  # RR (stance)
+    0.0, 0.52, -2.13,  # RL (swing)
 ]
 
-# Posture 1: FR+RL late swing & plant, FL+RR late stance push
-# Drives d_pos further toward 0.67 - 1.13 = -0.46
-pose_1 = [
-    0.0, 0.67, -1.78,  # FR: extend forward and plant
-    0.0, 1.13, -1.72,  # FL: finish stance push with extended calf support
-    0.0, 1.13, -1.72,  # RR: finish stance push with extended calf support
-    0.0, 0.67, -1.78   # RL: extend forward and plant
+# k1: FL+RR swing, FR+RL stance
+k1[:, 5] = [
+    0.0, 1.24, -1.51,  # FR (stance)
+    0.0, 0.52, -2.13,  # FL (swing)
+    0.0, 0.52, -2.13,  # RR (swing)
+    0.0, 1.24, -1.51,  # RL (stance)
 ]
 
-# Posture 2: FL+RR early swing (calf tucked), FR+RL early stance sweep & support
-# Drives d_pos toward 1.01 - 0.79 = +0.22 while calf tucks clear of ground
-pose_2 = [
-    0.0, 1.01, -1.68,  # FR: stance sweep with firm calf support
-    0.0, 0.79, -2.34,  # FL: lift and swing forward
-    0.0, 0.79, -2.34,  # RR: lift and swing forward
-    0.0, 1.01, -1.68   # RL: stance sweep with firm calf support
+# --- Steer right pair (heading_err > 0.015: robot angled left, push harder with left legs) ---
+# k2: FR+RL swing, FL+RR stance
+k2[:, 5] = [
+    0.0, 0.545, -2.13, # FR (swing slightly shorter)
+    0.0, 1.29, -1.51,  # FL (stance stronger push)
+    0.0, 1.19, -1.51,  # RR (stance lighter push)
+    0.0, 0.495, -2.13, # RL (swing slightly further)
 ]
 
-# Posture 3: FL+RR late swing & plant, FR+RL late stance push
-# Drives d_pos further toward 1.13 - 0.67 = +0.46
-pose_3 = [
-    0.0, 1.13, -1.72,  # FR: finish stance push with extended calf support
-    0.0, 0.67, -1.78,  # FL: extend forward and plant
-    0.0, 0.67, -1.78,  # RR: extend forward and plant
-    0.0, 1.13, -1.72   # RL: finish stance push with extended calf support
+# k3: FL+RR swing, FR+RL stance
+k3[:, 5] = [
+    0.0, 1.19, -1.51,  # FR (stance lighter push)
+    0.0, 0.495, -2.13, # FL (swing slightly further)
+    0.0, 0.545, -2.13, # RR (swing slightly shorter)
+    0.0, 1.29, -1.51,  # RL (stance stronger push)
 ]
 
-matrices = [
-    make_matrix(pose_0),
-    make_matrix(pose_1),
-    make_matrix(pose_2),
-    make_matrix(pose_3),
+# --- Steer left pair (heading_err < -0.015: robot angled right, push harder with right legs) ---
+# k4: FR+RL swing, FL+RR stance
+k4[:, 5] = [
+    0.0, 0.495, -2.13, # FR (swing slightly further)
+    0.0, 1.19, -1.51,  # FL (stance lighter push)
+    0.0, 1.29, -1.51,  # RR (stance stronger push)
+    0.0, 0.545, -2.13, # RL (swing slightly shorter)
 ]
+
+# k5: FL+RR swing, FR+RL stance
+k5[:, 5] = [
+    0.0, 1.29, -1.51,  # FR (stance stronger push)
+    0.0, 0.545, -2.13, # FL (swing slightly shorter)
+    0.0, 0.495, -2.13, # RR (swing slightly further)
+    0.0, 1.19, -1.51,  # RL (stance lighter push)
+]
+
+matrices = [k0, k1, k2, k3, k4, k5]
 
 def selector(robot_state):
-    # Diagonal average thigh positions and velocities
-    q_diag1 = 0.5 * (robot_state[1] + robot_state[10])   # FR, RL thighs
-    q_diag2 = 0.5 * (robot_state[4] + robot_state[7])    # FL, RR thighs
-    dq_diag1 = 0.5 * (robot_state[13] + robot_state[22])
-    dq_diag2 = 0.5 * (robot_state[16] + robot_state[19])
+    # q > 0 when FR+RL are swept back relative to FL+RR
+    q = (robot_state[1] + robot_state[10]) - (robot_state[4] + robot_state[7])
+    dq = (robot_state[13] + robot_state[22]) - (robot_state[16] + robot_state[19])
 
-    # Diagonal average calf positions (tucked calf is more negative, leading thigh velocity)
-    c_diag1 = 0.5 * (robot_state[2] + robot_state[11])   # FR, RL calves
-    c_diag2 = 0.5 * (robot_state[5] + robot_state[8])    # FL, RR calves
-
-    d_pos = q_diag1 - q_diag2
-    d_vel = dq_diag1 - dq_diag2
-    d_calf = c_diag1 - c_diag2
-
-    # Outer limits trigger swing reversal
-    if d_pos > 0.19:
-        return 0
-    elif d_pos < -0.19:
-        return 2
-
-    # Light calf damping prevents impact velocity chatter and triggers smooth end-of-stride reversal
-    phase_rate = d_vel + 1.2 * d_calf
-
-    # Inside hysteresis band [-0.19, 0.19], advance monotonically from lift (0/2) to plant (1/3)
-    if phase_rate <= 0.0:
-        return 0 if d_pos > -0.05 else 1
+    thresh = 0.38
+    if q <= -thresh:
+        phase = 1  # FR+RL reached forward -> switch to FR+RL stance (FL+RR swing)
+    elif q >= thresh:
+        phase = 0  # FL+RR reached forward -> switch to FR+RL swing (FL+RR stance)
     else:
-        return 2 if d_pos < 0.05 else 3
+        phase = 1 if dq > 0.0 else 0
+
+    heading_err = robot_state[26] + 0.04 * robot_state[29]
+    if heading_err > 0.015:
+        return phase + 2
+    elif heading_err < -0.015:
+        return phase + 4
+    else:
+        return phase
 
 robot.simulate_classifier(matrices, selector)

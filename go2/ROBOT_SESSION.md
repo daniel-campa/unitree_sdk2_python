@@ -69,12 +69,13 @@ It must say PASS, with sensible battery, temperatures and joint angles. **In eve
 python go2/calibrate.py --robot "$IFACE"
 ```
 
-It runs five steps in order. Before each one it says what to do with the robot and waits for Enter (`s` skips a step, `q` stops):
+It runs six steps in order. Before each one it says what to do with the robot and waits for Enter (`s` skips a step, `q` stops):
 
 | Step | Robot | What it does | Moves the robot? |
 |---|---|---|---|
 | connection | standing in sport mode after start-up | checks the link and the state, and reads the robot's serial number | no |
 | passive | standing still in sport mode, 10 s | state rate, timing, sensor noise, IMU bias at rest | no |
+| lidar | standing still in sport mode on a flat floor, **a flat board square to it 1.0 m ahead** of its centre (`--lidar-wall-distance`), 10 s | what each lidar topic sends, and where the lidar sits on the body, for `run_policy.py --env-source lidar` (`lidar_calibrate.py`) | no |
 | inputs | **you walk it with the remote** in sport mode, 2 min | records everything, then checks each of the 37 policy inputs against a second source (see [the input table](#reference-what-the-policy-reads)), including the velocity and height estimate against Unitree's own | no, only you do |
 | hang | **hanging in the harness, feet clear**, 2.5 min | latency, torque scale, friction, tracking at 0.5–4 Hz, each foot sensor's unloaded reading | **yes, the legs** |
 | stand | **on the floor**, harness slack, 20 s | standing sag and torque, standing height, each foot sensor's loaded reading | **yes, stands up** |
@@ -197,6 +198,8 @@ Everything the robot sends is saved, whether or not the scripts use it.
 | `go2/logs/calibration/<time>/` | `calibrate.py` | each step's full log: connection output, passive and hang and stand recordings, the input walk recording, `inputs_check.txt`, `summary.txt` |
 | `go2/logs/<time>.npz` | `run_policy.py`, at 500 Hz | joint angles, velocities, accelerations, torques, temperatures and lost-packet counts; commanded and torque-capped targets; IMU quaternion, rpy, gyro and accelerometer; foot force (raw and Unitree's estimate); battery, voltage and current; the robot's tick and the state's age; the estimator's velocity, height and standing feet; **the full 37-input robot_state every cycle**. For every policy call: the exact robot_state and env vector the policy got, the matrix it returned, the target, and the state's age. The calibration it ran with. Also rt/utlidar/robot_odom if it publishes. |
 | `go2/logs/watch/<time>.npz` | `watch.py`, every message | every field of rt/lowstate (all of the above plus raw encoder values, motor modes, battery cells and temperatures, remote buttons, fan speeds); every rt/lowcmd sent; every field of rt/sportmodestate (Unitree's position, velocity, body height, foot positions and speeds, gait, obstacle ranges) and rt/utlidar/robot_odom while they publish; the estimator and the full robot_state for every message; once a second, the computer's CPU, memory, temperature and run_policy.py's CPU share; a usage summary (energy, battery, torque share, temperatures, lost packets, estimated distance). |
+| `go2/logs/<time>_lidar.npz` | `run_policy.py`'s lidar process, every cloud | every cloud's arrival time, topic, frame and point count on both cloud topics; the env vector from every usable cloud; a 4096-point subset of every cloud that arrived while walking, in the cloud's own frame, with the IMU's roll and pitch. The run log has the env vector the policy got beside the lidar's (`env_given`, `env_lidar`). |
+| `go2/logs/lidar/<time>.json`, `.npz` | `lidar_calibrate.py` (or `calibrate.py`'s `lidar` step, in its folder) | each lidar topic's rate, frame and fields; the lidar's mount on the body; the env vector check; the clouds it used |
 | `<log>.diagnosis.json`, `<watch>.inputs.json` | `diagnose.py` | analysis results, if you ran them |
 | phone videos, notes | you | what the robot actually did |
 
@@ -223,12 +226,12 @@ Each policy call gets a 37-input `robot_state` and multiplies its output matrix 
 
 | Column | In S-M-ICRL, flat floor | On the robot | Same? |
 |---|---|---|---|
-| 0–2 ground probes | floor height 0.3 m ahead minus body height, rebuilt at 25 Hz: on a flat floor, minus the body height (−0.269 to −0.277 in the walk) | minus the estimated height, rebuilt at 25 Hz (`--env-hz`). `--no-estimate`/`--fill-unmeasured`: fixed at −0.262 | yes, on a flat floor |
-| 3 clearance above | 2.0 (open sky) | 2.0 | yes |
-| 4 obstacle distance | about 10.0 (clear path) | 10.0 | yes |
+| 0–2 ground probes | floor height 0.3 m ahead minus body height, rebuilt at 25 Hz: on a flat floor, minus the body height (−0.269 to −0.277 in the walk) | minus the estimated height, rebuilt at 25 Hz (`--env-hz`). `--no-estimate`/`--fill-unmeasured`: fixed at −0.262. `--env-source lidar`: the lidar's points at the same spots | yes, on a flat floor; with the lidar, anywhere it sees the spots |
+| 3 clearance above | 2.0 (open sky) | 2.0. `--env-source lidar`: the lowest thing over the body that's above 0.5 m | yes; with the lidar, if it sees overhead |
+| 4 obstacle distance | about 10.0 (clear path) | 10.0. `--env-source lidar`: S-M-ICRL's ray traced through the lidar's points | yes on a clear path; with the lidar, anywhere |
 | 5 bias | 1.0 | 1.0 | yes |
 
-As in S-M-ICRL, the policy's matrix is held between calls and multiplied by the latest env vector every control cycle, so a policy with gains on the probes adjusts its targets at 25 Hz. Neither argon policy uses columns 0–4. Obstacles and steps can't be sensed: the probes assume a flat floor, and clearance and obstacle distance are always "open". `class_argon_walk` reads inputs 1, 2, 4, 5, 7, 8, 10, 11 and 13, 16, 19, 22 (thighs, calves and thigh velocities). `func_argon_walk` also reads 24–29 and 31 (sideways velocity).
+As in S-M-ICRL, the policy's matrix is held between calls and multiplied by the latest env vector every control cycle, so a policy with gains on the probes adjusts its targets at 25 Hz. Neither argon policy uses columns 0–4. Without `--env-source lidar`, obstacles and steps can't be sensed: the probes assume a flat floor, and clearance and obstacle distance are always "open". With it they come from the lidar (`go2/lidar_env.py`), which on every run is also recorded beside the flat values, so the two can be compared after a flat-floor run. `class_argon_walk` reads inputs 1, 2, 4, 5, 7, 8, 10, 11 and 13, 16, 19, 22 (thighs, calves and thigh velocities). `func_argon_walk` also reads 24–29 and 31 (sideways velocity).
 
 ### The velocity and height estimate (30–33)
 
