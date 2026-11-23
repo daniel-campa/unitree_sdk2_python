@@ -9,9 +9,9 @@ import time
 import cv2
 
 from phone_camera import Stream
-from tag_tracker import FLOOR_TAG_ID, ROBOT_TAG_ID, make_detector
+from tag_tracker import CRATE_TAG_ID, FLOOR_TAG_ID, ROBOT_TAG_ID, make_detector
 
-NAMES = {ROBOT_TAG_ID: "robot", FLOOR_TAG_ID: "floor"}
+NAMES = {ROBOT_TAG_ID: "robot", FLOOR_TAG_ID: "floor", CRATE_TAG_ID: "crate"}
 
 stream = Stream(sys.argv[1])
 stream.wait_first()

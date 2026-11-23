@@ -4,8 +4,9 @@
 The robot has no position measurement once run_policy.py releases sport mode
 (check_odom.py showed that every odometry topic stops). This script measures it from
 outside instead. A phone on a tripod films the lane, recorded with phone_camera.py.
-One tag is on the robot's back and one lies flat on the floor. Print both with
-go2/make_tag_sheets.py.
+One tag is on the robot's back and one lies flat on the floor. For push_box_turn a
+third lies flat on the crate's top, and is tracked when it's in the picture. Print
+them with go2/make_tag_sheets.py.
 
     python go2/tag_tracker.py calibrate CALIB.mp4                 # once per phone and zoom; writes go2/logs/camera.json
     python go2/tag_tracker.py track WALK.mp4                      # robot tag relative to the floor tag
@@ -17,7 +18,8 @@ moved slowly all over the picture at different tilts. Record it with the same
 
 track writes WALK_track.npz (and WALK_track.png) next to the video. Positions are in
 the floor tag's frame: forward along its arrow, left of it, up from the floor, and the
-robot tag's yaw from the arrow (anticlockwise seen from above). Times are the frames'
+robot tag's yaw from the arrow (anticlockwise seen from above). The crate tag's are the
+same columns with a crate_ prefix, NaN where it wasn't seen. Times are the frames'
 arrival times from WALK.json, on time.perf_counter() like run_policy.py's log, minus
 --latency. With --run, it reports the forward and left distance over the log's
 walking stage, along the robot's heading at the start, and the walk reward's
@@ -39,6 +41,7 @@ DEFAULT_CAMERA = LOG_DIR / "camera.json"
 
 ROBOT_TAG_ID, ROBOT_TAG_M = 0, 0.120  # black square edge, as printed by make_tag_sheets.py
 FLOOR_TAG_ID, FLOOR_TAG_M = 1, 0.140
+CRATE_TAG_ID, CRATE_TAG_M = 2, 0.140
 BOARD_INNER = (6, 8)  # inner corners of make_tag_sheets.py's 7 x 9 board
 BOARD_SQUARE_MM = 25.0
 
@@ -162,21 +165,21 @@ def make_detector():
     return cv2.aruco.ArucoDetector(dictionary, params)
 
 
-def detect_all(path, robot_id, floor_id, annotate=None):
-    """Corners of each tag in each frame (NaN where unseen), and the picture size."""
+def detect_all(path, tag_ids, annotate=None):
+    """Corners of each of tag_ids in each frame, (N, 4, 2) per ID (NaN where unseen), and the picture size."""
     detector = make_detector()
-    robot, floor, size = [], [], None
+    found, size = {tag_id: [] for tag_id in tag_ids}, None
     for _, frame in read_frames(path):
         size = frame.shape[1::-1]
         corners, ids, _ = detector.detectMarkers(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
         seen = {} if ids is None else {int(i): c.reshape(4, 2) for i, c in zip(ids.ravel(), corners)}
-        robot.append(seen.get(robot_id, np.full((4, 2), np.nan)))
-        floor.append(seen.get(floor_id, np.full((4, 2), np.nan)))
+        for tag_id, track in found.items():
+            track.append(seen.get(tag_id, np.full((4, 2), np.nan)))
         if annotate is not None:
             annotate.append(frame)
     if size is None:
         raise TrackError(f"{path} has no frames")
-    return np.array(robot), np.array(floor), size
+    return {tag_id: np.array(track) for tag_id, track in found.items()}, size
 
 
 def solve_tag(corners, side, matrix, dist):
@@ -209,17 +212,17 @@ def floor_pose(floor, matrix, dist, side):
     return rotation, translation, info
 
 
-def robot_poses(robot, floor_rotation, floor_translation, matrix, dist, side):
-    """Robot tag positions and angles in the floor tag's frame, NaN where unseen."""
-    n = len(robot)
+def tag_poses(corners, floor_rotation, floor_translation, matrix, dist, side):
+    """Positions and angles of a tag lying nearly flat, in the floor tag's frame, NaN where unseen."""
+    n = len(corners)
     out = {k: np.full(n, np.nan) for k in ("forward", "left", "up", "yaw", "tilt", "reprojection_px")}
     floor_up = floor_rotation[:, 2]
-    for i in np.flatnonzero(~np.isnan(robot[:, 0, 0])):
-        solutions = solve_tag(robot[i], side, matrix, dist)
+    for i in np.flatnonzero(~np.isnan(corners[:, 0, 0])):
+        solutions = solve_tag(corners[i], side, matrix, dist)
         if not solutions:
             continue
-        # The tag lies nearly flat on the robot's back, so of IPPE's two solutions,
-        # take the one whose face points most nearly the same way as the floor's.
+        # The tag lies nearly flat, on the robot's back or the crate's top, so of IPPE's
+        # two solutions, take the one whose face points most nearly the same way as the floor's.
         rotation, translation, error = max(solutions, key=lambda s: s[0][:, 2] @ floor_up)
         position = floor_rotation.T @ (translation - floor_translation)
         in_floor = floor_rotation.T @ rotation
@@ -322,28 +325,32 @@ def save_plot(path, t, track, seen, walk):
     print(f"Plot: {path}")
 
 
-def write_annotated(path, frames, robot, floor, matrix, dist, floor_rotation, floor_translation, fps):
+def write_annotated(path, frames, robot, floor, crate, matrix, dist, floor_rotation, floor_translation, fps):
     height, width = frames[0].shape[:2]
     writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
     rvec = cv2.Rodrigues(floor_rotation)[0]
-    for frame, r, f in zip(frames, robot, floor):
-        for corners, colour in ((r, (0, 0, 255)), (f, (0, 255, 0))):
+    for frame, r, f, c in zip(frames, robot, floor, crate):
+        for corners, colour in ((r, (0, 0, 255)), (f, (0, 255, 0)), (c, (255, 0, 0))):
             if not np.isnan(corners[0, 0]):
                 cv2.polylines(frame, [corners.astype(np.int32)], True, colour, 2)
         cv2.drawFrameAxes(frame, matrix, dist, rvec, floor_translation, 0.3, 2)
         writer.write(frame)
     writer.release()
-    print(f"Annotated video: {path} (red = robot tag, green = floor tag; floor axes x red, y green, z blue)")
+    print(f"Annotated video: {path} (red = robot tag, green = floor tag, blue = crate tag; "
+          f"floor axes x red, y green, z blue)")
 
 
 def track(args):
     frames = [] if args.annotate else None
-    robot, floor, size = detect_all(args.video, args.robot_id, args.floor_id, frames)
+    corners, size = detect_all(args.video, (args.robot_id, args.floor_id, args.crate_id), frames)
+    robot, floor, crate = corners[args.robot_id], corners[args.floor_id], corners[args.crate_id]
     matrix, dist = load_camera(args.camera, size)
     t, on_run_clock = frame_times(args.video, len(robot), args.latency)
     floor_rotation, floor_translation, floor_info = floor_pose(floor, matrix, dist, args.floor_size_m)
-    track = robot_poses(robot, floor_rotation, floor_translation, matrix, dist, args.robot_size_m)
+    track = tag_poses(robot, floor_rotation, floor_translation, matrix, dist, args.robot_size_m)
     seen = ~np.isnan(track["forward"])
+    crate_track = tag_poses(crate, floor_rotation, floor_translation, matrix, dist, args.crate_size_m)
+    crate_seen = ~np.isnan(crate_track["forward"])
 
     print(f"{len(t)} frames over {t[-1] - t[0]:.1f} s. Robot tag seen in {seen.mean():.0%}, "
           f"floor tag in {floor_info['seen_fraction']:.0%}.")
@@ -360,6 +367,12 @@ def track(args):
         i, j = np.flatnonzero(seen)[[0, -1]]
         print(f"First seen at {track['forward'][i]:+.3f} m forward, {track['left'][i]:+.3f} m left; "
               f"last at {track['forward'][j]:+.3f} m forward, {track['left'][j]:+.3f} m left.")
+    if crate_seen.any():
+        xy = np.column_stack([crate_track["forward"], crate_track["left"]])[crate_seen]
+        middle = np.median(xy, axis=0)
+        print(f"Crate tag seen in {crate_seen.mean():.0%} of frames, at {middle[0]:+.3f} m forward, "
+              f"{middle[1]:+.3f} m left (median), {np.median(crate_track['up'][crate_seen]):.3f} m up; "
+              f"furthest frame {np.linalg.norm(xy - middle, axis=1).max() * 100:.1f} cm from that.")
 
     walk = None
     if args.run:
@@ -372,15 +385,18 @@ def track(args):
     out = args.video.with_name(args.video.stem + "_track.npz")
     meta = {"video": str(args.video), "camera": str(args.camera), "latency_s": args.latency,
             "robot_tag": [args.robot_id, args.robot_size_m], "floor_tag": [args.floor_id, args.floor_size_m],
+            "crate_tag": [args.crate_id, args.crate_size_m],
             "floor": floor_info, "clock": "time.perf_counter" if on_run_clock else "video",
             "run": str(args.run) if args.run else None}
-    np.savez_compressed(out, meta=json.dumps(meta), t=t, seen=seen, **track)
+    np.savez_compressed(out, meta=json.dumps(meta), t=t, seen=seen, **track, crate_seen=crate_seen,
+                        **{f"crate_{key}": values for key, values in crate_track.items()})
     print(f"Wrote {out}")
     if not args.no_plot:
         save_plot(out.with_suffix(".png"), t, track, seen, walk)
     if args.annotate:
         fps = (len(t) - 1) / (t[-1] - t[0]) if len(t) > 1 and t[-1] > t[0] else 15.0
-        write_annotated(args.annotate, frames, robot, floor, matrix, dist, floor_rotation, floor_translation, fps)
+        write_annotated(args.annotate, frames, robot, floor, crate, matrix, dist, floor_rotation, floor_translation,
+                        fps)
     if seen.mean() < MIN_ROBOT_DETECTION:
         print(f"FAIL: the robot tag was seen in only {seen.mean():.0%} of frames. Check the light, the focus "
               "and that the tag faces the camera.")
@@ -404,10 +420,13 @@ def main():
                      help="seconds the stream lags the robot, taken off the frame times (default: %(default)s)")
     trk.add_argument("--robot-id", type=int, default=ROBOT_TAG_ID)
     trk.add_argument("--floor-id", type=int, default=FLOOR_TAG_ID)
+    trk.add_argument("--crate-id", type=int, default=CRATE_TAG_ID)
     trk.add_argument("--robot-size-m", type=float, default=ROBOT_TAG_M,
                      help="measured black square of the robot tag (default: %(default)s)")
     trk.add_argument("--floor-size-m", type=float, default=FLOOR_TAG_M,
                      help="measured black square of the floor tag (default: %(default)s)")
+    trk.add_argument("--crate-size-m", type=float, default=CRATE_TAG_M,
+                     help="measured black square of the crate tag (default: %(default)s)")
     trk.add_argument("--annotate", type=Path, help="also write a video with the tags outlined, to check by eye")
     trk.add_argument("--no-plot", action="store_true", help="don't save a plot")
     args = parser.parse_args()

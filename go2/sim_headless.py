@@ -103,7 +103,7 @@ lidar = None
 if args.lidar:
     from sim_lidar import SimLidar
 
-    lidar = SimLidar(model, data)
+    lidar = SimLidar(model, data, args.domain)
 elif args.odom:
     from sim_lidar import SimOdom
 

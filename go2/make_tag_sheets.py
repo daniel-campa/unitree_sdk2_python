@@ -3,16 +3,20 @@
 
     python go2/make_tag_sheets.py                 # go2/tags/tag_sheets_a4.pdf and tag_sheets_letter.pdf
 
-Three pages:
+Four pages:
   1. the robot tag (tag36h11 ID 0, black square 120 mm), taped flat on the Go2's back between
      the handle and the head
   2. the floor tag (tag36h11 ID 1, black square 140 mm), flat on the floor beside the lane
-  3. a checkerboard (7 x 9 squares of 25 mm, so 6 x 8 inner corners) for calibrating the camera
+  3. the crate tag (tag36h11 ID 2, black square 140 mm), flat on the middle of the top of
+     push_box_turn's crate
+  4. a checkerboard (7 x 9 squares of 25 mm, so 6 x 8 inner corners) for calibrating the camera
 
 Print at 100% ("actual size"), never "fit to page". Each page has a 100 mm bar, so
 measure it to check. The tags come from AprilRobotics/apriltag-imgs (go2/tags/, BSD
 licence). They're drawn rotated 180 degrees from those images, so that OpenCV's idea
-of the tag's top edge is the top of the page, where the arrow points.
+of the tag's top edge is the top of the page, where the arrow points. A tag without its
+image there (ID 2 has none) is drawn from OpenCV's own tag36h11 marker, which is that
+image already turned: they match cell for cell for IDs 0 and 1.
 """
 import argparse
 from pathlib import Path
@@ -30,7 +34,8 @@ TAG_DIR = Path(__file__).resolve().parent / "tags"
 PAGES = {"a4": (210.0, 297.0), "letter": (215.9, 279.4)}  # mm
 ROBOT_TAG = {"id": 0, "black_mm": 120.0}
 FLOOR_TAG = {"id": 1, "black_mm": 140.0}
-BOARD = {"columns": 7, "rows": 9, "square_mm": 25.0}  # squares; inner corners are one fewer each way
+CRATE_TAG = {"id": 2, "black_mm": 140.0}
+BOARD ={"columns": 7, "rows": 9, "square_mm": 25.0}  # squares; inner corners are one fewer each way
 CUT_MARGIN_CELLS = 0.5  # white kept outside the tag's own one-cell white border
 GREY = "0.6"
 SCALE_BAR_Y = 14.0  # mm above the bottom of the page
@@ -39,7 +44,15 @@ NOTE_SPACING = 5.0  # mm
 
 def tag_cells(tag_id):
     """10 x 10 booleans (True = black), row 0 at the top of the page, rotated to match OpenCV."""
-    image = np.array(Image.open(TAG_DIR / f"tag36_11_{tag_id:05d}.png").convert("L"))
+    path = TAG_DIR / f"tag36_11_{tag_id:05d}.png"
+    if not path.exists():
+        import cv2
+        cells = np.zeros((10, 10), dtype=bool)
+        marker = cv2.aruco.generateImageMarker(cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11),
+                                               tag_id, 8, borderBits=1)
+        cells[1:9, 1:9] = marker < 128
+        return cells
+    image = np.array(Image.open(path).convert("L"))
     if image.shape != (10, 10):
         raise ValueError(f"tag {tag_id}: expected a 10 x 10 image, got {image.shape}")
     return np.rot90(image < 128, 2)
@@ -130,6 +143,9 @@ def make(path, size):
         tag_page(size, FLOOR_TAG, "Floor tag", "walking direction",
                  ["Lay it flat beside the lane, on the camera's side, arrow along the lane.",
                   "Forward, left and yaw are measured from it, so don't move it during a session."]),
+        tag_page(size, CRATE_TAG, "Crate tag", "any way round",
+                 ["Lay it flat on the middle of the crate's top, face up. Only its position is used,",
+                  "so the arrow can point anywhere."]),
         board_page(size),
     ]
     with PdfPages(path, metadata={"Title": "Go2 AprilTag sheets", "Creator": "go2/make_tag_sheets.py"}) as pdf:

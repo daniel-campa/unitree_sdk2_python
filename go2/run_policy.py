@@ -17,6 +17,12 @@ the file's joint angles, interpolated between samples, after a ramp to its first
 sample. A fault, the remote's B button or Ctrl-C goes straight
 to damping. Start the simulator with `python go2/sim_headless.py --flat --dt 0.002`.
 
+The policy's env vector is S-M-ICRL's on open, flat floor, for the layout --env-mode
+gives. With --env-source lidar it's rebuilt instead from the lidar's point cloud by
+go2/lidar_env.py, in a process of its own (go2/lidar_worker.py), using the lidar mount
+that go2/lidar_calibrate.py measured. A walk then needs a fresh usable cloud: without
+one it doesn't start, and if the clouds stop for --max-cloud-age it faults.
+
 The log also keeps rt/utlidar/robot_odom, the robot's position estimate, when it
 publishes. Nothing here acts on it; S-M-ICRL scores walking with it.
 
@@ -31,6 +37,7 @@ Exit status: 0 = finished, 1 = stopped early, 2 = refused before commanding anyt
 """
 import argparse
 import builtins
+import gc
 import hashlib
 import json
 import select
@@ -46,6 +53,8 @@ from typing import NamedTuple
 
 import numpy as np
 from check_connection import DEFAULT_INTERFACE, JOINTS, check_interface, state_problems
+from lidar_env import CLOUD_WINDOW_S, MOUNT_FILE, EnvLayout, load_mount
+from lidar_worker import LidarProcess
 from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient
 from unitree_sdk2py.core.channel import (
     ChannelFactoryInitialize,
@@ -77,8 +86,16 @@ KP, KD = 80.0, 4.0
 # Mean base height while walking in S-M-ICRL. On a flat floor the terrain probes
 # read the negative of this, and the policy's calf targets depend on it.
 PROBE_HEIGHT = 0.262
-# What S-M-ICRL reports with nothing overhead or ahead.
-OPEN_CLEARANCE, OPEN_OBSTACLE_DISTANCE = 2.0, 10.0
+ENV_HZ = 25.0  # S-M-ICRL's env_hz in the Go2 walk configs
+
+# The lidar, read in a process of its own (go2/lidar_worker.py, go2/lidar_env.py).
+# rt/utlidar/cloud_deskewed is in the odom frame, which needs rt/utlidar/robot_odom,
+# and that stops once sport mode is released; rt/utlidar/cloud is in the lidar's own
+# frame and needs only the mount.
+LIDAR_TOPICS = {"cloud": "rt/utlidar/cloud", "cloud_deskewed": "rt/utlidar/cloud_deskewed"}
+MAX_CLOUD_AGE = 0.5  # s; with --env-source lidar, an older cloud stops the walk
+LIDAR_WAIT_S = 3.0  # how long --robot waits for a usable cloud before refusing
+ODOM_FRESH_S = 0.2  # an odometry pose older than this can't place a cloud in the odom frame
 
 DT = 0.002  # rt/lowcmd period, as in Unitree's examples
 STAND_UP_S = 3.0
@@ -139,6 +156,10 @@ WEIGHT_NEG_TOL = 1e-9
 
 class Refused(Exception):
     """A reason not to start. Nothing has been commanded."""
+
+
+class NotWalking(Exception):
+    """A reason, found while standing, not to start the walk; the robot lies down normally."""
 
 
 class Fault(Exception):
@@ -224,22 +245,26 @@ def build_robot_state(state, start_yaw, fill_height=None):
     ])
 
 
-def flat_floor_env(probe_height):
-    """S-M-ICRL's env vector on a clear, flat floor: three probes, clearance, obstacle, bias."""
-    probe = -probe_height
-    return np.array([probe, probe, probe, OPEN_CLEARANCE, OPEN_OBSTACLE_DISTANCE, 1.0])
-
-
-def policy_target(policy, robot_state, env):
+def policy_gains(policy, robot_state, env_size):
+    """The policy's (12, env_size) matrix for this state."""
     try:
         gains = np.asarray(policy(robot_state), dtype=float)
     except Exception as error:
         raise Fault(f"policy failed: {error}") from error
-    if gains.shape != (12, env.size):
-        raise Fault(f"policy returned shape {gains.shape}, expected (12, {env.size})")
+    if gains.shape != (12, env_size):
+        raise Fault(f"policy returned shape {gains.shape}, expected (12, {env_size})")
     if not np.isfinite(gains).all():
         raise Fault("policy returned non-finite values")
+    return gains
+
+
+def gains_target(gains, env):
+    """Joint targets, gains @ env clamped to the joint ranges, as S-M-ICRL does every step."""
     return np.clip(gains @ env, JOINT_LOW, JOINT_HIGH)
+
+
+def policy_target(policy, robot_state, env):
+    return gains_target(policy_gains(policy, robot_state, env.size), env)
 
 
 def limit_for_torque(target, q, dq, kp, kd, torque_cap):
@@ -564,6 +589,11 @@ class Controller:
         self.worst_state_age = 0.0
         self.policy_calls = self.target_changes = 0
         self.worst_policy_time = 0.0
+        self.odom = None  # the OdomRecorder, for clouds in the odom frame
+        self.lidar = None  # a LidarProcess to poll every cycle, with --env-source lidar
+        self.probe_height = PROBE_HEIGHT  # the base height the env vector assumes
+        self.env_rows = []  # one per env rebuild while walking: see save_log
+        self.not_walked = None  # why the walk wasn't started, if it wasn't
 
         self.cmd = unitree_go_msg_dds__LowCmd_()
         self.cmd.head[0], self.cmd.head[1] = 0xFE, 0xEF
@@ -585,6 +615,9 @@ class Controller:
         problem = safety_problem(state, check_range)
         if problem:
             raise Fault(problem)
+        if self.lidar is not None:
+            now = time.perf_counter()
+            self.lidar.poll(now, state.rpy, self.odom.latest_pose(now) if self.odom is not None else None)
         return state
 
     def send(self, q, kp, kd):
@@ -664,26 +697,57 @@ class Controller:
         sys.stdin.readline()
         return True
 
-    def walk(self, policy, env, policy_hz, seconds, fill_height=None):
+    def walk(self, policy, env, policy_hz, seconds, fill_height=None, env_hz=ENV_HZ):
+        """Run the policy as S-M-ICRL's simulate_rollout does.
+
+        The policy gives a matrix every 1/policy_hz, and the target is the held matrix
+        times the latest env vector, every cycle. With the lidar the env vector is
+        rebuilt every 1/env_hz; otherwise it stays env.
+        """
         start_yaw = self.latest_state(check_range=True).rpy[2]
-        target = None
-        next_call = 0
+        gains = target = None
+        next_call = next_env = 0
+        live_env = env.copy()
+        if self.lidar is not None:
+            self.lidar.saving = True
 
         def target_at(elapsed, state):
-            nonlocal target, next_call
-            if target is None or elapsed >= next_call / policy_hz:
+            nonlocal gains, target, next_call, next_env, live_env
+            if self.lidar is not None and (gains is None or elapsed >= next_env / env_hz):
+                now = time.perf_counter()
+                built = self.lidar.build(now, self.probe_height)
+                if built is None:
+                    raise Fault(f"no usable lidar cloud within {self.lidar.max_age:g} s ({self.lidar.status(now)})")
+                live_env, info, age, topic = built
+                self.env_rows.append((now - self.clock_start, live_env.copy(), age, topic, info["points"],
+                                      info["fallback"], bool(info["object_hit"])))
+                next_env = int(elapsed * env_hz) + 1
+            if gains is None or elapsed >= next_call / policy_hz:
                 robot_state = build_robot_state(state, start_yaw, fill_height)
                 call_start = time.perf_counter()
-                new_target = policy_target(policy, robot_state, env)
+                gains = policy_gains(policy, robot_state, live_env.size)
                 self.worst_policy_time = max(self.worst_policy_time, time.perf_counter() - call_start)
+                new_target = gains_target(gains, live_env)
                 if target is not None and np.abs(new_target - target).max() > 0.1:
                     self.target_changes += 1
-                target = new_target
                 self.policy_calls += 1
                 next_call = int(elapsed * policy_hz) + 1  # skip calls missed in a stall
+            target = gains_target(gains, live_env)
             return target
 
-        self.run_phase("walking", seconds, target_at)
+        try:
+            self.run_phase("walking", seconds, target_at)
+        finally:
+            if self.lidar is not None:
+                self.lidar.saving = False
+
+    def check_lidar_ready(self):
+        """With the lidar, don't start walking without a usable, fresh cloud."""
+        if self.lidar is None:
+            return
+        now = time.perf_counter()
+        if self.lidar.current(now) is None:
+            raise NotWalking(f"--env-source lidar, but there's no usable lidar cloud: {self.lidar.status(now)}")
 
     def play(self, rows, rate, seconds):
         self.move_to("moving to the first sample", rows[0], RETURN_HOME_S)
@@ -696,9 +760,15 @@ class Controller:
         if seconds > 0:
             self.check_ready_to_walk()
             if not ask_before_walking or self.wait_for_go():
-                motion()
-                self.move_to("returning home", HOME, RETURN_HOME_S)
-                self.hold("settling after walking", HOME, 1.0)
+                try:
+                    self.check_lidar_ready()
+                except NotWalking as reason:
+                    self.not_walked = str(reason)
+                    print(f"NOT WALKING: {reason}", flush=True)
+                else:
+                    motion()
+                    self.move_to("returning home", HOME, RETURN_HOME_S)
+                    self.hold("settling after walking", HOME, 1.0)
         self.move_to("lying down", LIE_DOWN, LIE_DOWN_S)
 
     def damp(self):
@@ -717,7 +787,14 @@ class Controller:
             return None
         path.parent.mkdir(parents=True, exist_ok=True)
         columns = {name: np.array(column) for name, column in zip(LOG_FIELDS, zip(*self.records))}
-        np.savez_compressed(path, meta=json.dumps(meta), **columns, **odom.columns(self.clock_start))
+        if self.env_rows:
+            # env_given is the vector the policy's matrices were multiplied by from env_t on.
+            names = ("env_t", "env_given", "env_cloud_age", "env_cloud_topic", "env_cloud_points", "env_fallback",
+                     "env_object_hit")
+            columns.update({name: np.array(c) for name, c in zip(names, zip(*self.env_rows))})
+        if self.lidar is not None:
+            meta = dict(meta, lidar=self.lidar.meta())  # the clouds are in its readings file
+        np.savez_compressed(path, meta=json.dumps(meta, default=str), **columns, **odom.columns(self.clock_start))
         return path
 
     def print_summary(self):
@@ -730,6 +807,23 @@ class Controller:
                   f"thigh {tau[:, 1::3].max():.1f}, calf {tau[:, 2::3].max():.1f} N·m")
         print(f"Timing: worst loop overrun {self.worst_overrun * 1000:.1f} ms, "
               f"oldest state {self.worst_state_age * 1000:.1f} ms")
+        if self.lidar is None:
+            return
+        m = self.lidar.meta()
+        if "clouds" in m:
+            print("Lidar: " + ", ".join(f"{t} {n} clouds ({u} usable)" for t, n, u in zip(m["topics"], m["clouds"], m["usable"]))
+                  + f", frames {m['frames']}, slowest cloud {m['worst_cloud_ms']:.1f} ms in its own process")
+            for problem, n in m["problems"].items():
+                print(f"  unusable x{n}: {problem}")
+        if m.get("error"):
+            print(f"  lidar process error: {m['error']}")
+        if m.get("readings_saved"):
+            print(f"Lidar readings: {m['readings_file']} ({m['saved_clouds']} clouds kept from the walk)")
+        if self.env_rows:
+            given = np.array([row[1] for row in self.env_rows])
+            names = [f"probe{i}" for i in range(self.lidar.layout.n_probes)] + ["clearance", "object_dist", "bias"]
+            print(f"Lidar env while walking, {len(given)} rebuilds: mean "
+                  + ", ".join(f"{n} {v:+.3f}" for n, v in zip(names, given.mean(axis=0))))
 
 
 class OdomRecorder:
@@ -746,6 +840,13 @@ class OdomRecorder:
         row = (time.perf_counter(), p.x, p.y, p.z, q.w, q.x, q.y, q.z)
         with self._lock:
             self._rows.append(row)
+
+    def latest_pose(self, now):
+        """The newest pose (x, y, z, qw, qx, qy, qz) if it arrived within ODOM_FRESH_S, else None."""
+        with self._lock:
+            if not self._rows or now - self._rows[-1][0] > ODOM_FRESH_S:
+                return None
+            return self._rows[-1][1:]
 
     def columns(self, clock_start):
         """odom_t on the log's clock, and odom_pose as x, y, z, qw, qx, qy, qz."""
@@ -775,7 +876,29 @@ def connect(args):
     problems = state_problems(monitor.msg)
     if problems:
         raise Refused("invalid robot state: " + "; ".join(problems))
-    return monitor, subscriber, OdomRecorder()
+    lidar = None
+    if args.env_source == "lidar":
+        lidar = LidarProcess(interface, domain, args.layout, args.lidar_mount, args.max_cloud_age, args.lidar_log,
+                             topics=[LIDAR_TOPICS[args.lidar_topic]], window=args.lidar_window)
+        if not lidar.wait_ready():
+            status = lidar.status(time.perf_counter())
+            lidar.stop(timeout=1.0)
+            raise Refused(f"the lidar process didn't start: {status}")
+    return monitor, subscriber, OdomRecorder(), lidar
+
+
+def wait_for_cloud(monitor, odom, lidar):
+    """Wait up to LIDAR_WAIT_S for a usable cloud, and refuse without one. Returns the lidar's status."""
+    deadline = time.perf_counter() + LIDAR_WAIT_S
+    while time.perf_counter() < deadline and lidar.current(time.perf_counter()) is None:
+        now = time.perf_counter()
+        lidar.poll(now, read_state(monitor.msg).rpy, odom.latest_pose(now))
+        time.sleep(0.05)
+    now = time.perf_counter()
+    status = lidar.status(now)
+    if lidar.current(now) is None:
+        raise Refused(f"--env-source lidar, but no usable lidar cloud in {LIDAR_WAIT_S:g} s: {status}")
+    return status
 
 
 def confirm_stop_button(monitor):
@@ -879,7 +1002,7 @@ def restore_sport_mode(name, monitor, finished):
     return False
 
 
-def prepare_robot(args, monitor, digest):
+def prepare_robot(args, monitor, digest, odom=None, lidar=None):
     """Run the checks and confirmations for a real robot. Return the original mode."""
     if not sys.stdin.isatty():
         raise Refused("--robot needs an interactive terminal, for the confirmations")
@@ -892,6 +1015,12 @@ def prepare_robot(args, monitor, digest):
         raise Refused(f"battery is at {battery}%, minimum {MIN_BATTERY_PERCENT}%")
     inputs = ("" if args.fill_height is None else
               f"  Inputs:  height fixed at {args.fill_height:g} m, body velocity at 0 (--fill-unmeasured)\n")
+    if not args.trajectory:
+        inputs += f"  Env:     {args.env_source} ({args.layout.mode} layout, {args.layout.size} values)\n"
+    if lidar is not None:
+        mount = f"mount from {args.lidar_mount_file}" if args.lidar_mount else "no mount"
+        inputs += (f"  Lidar:   {LIDAR_TOPICS[args.lidar_topic]}, {mount}, clouds of the last {args.lidar_window:g} s; "
+                   f"now (sport mode on): {wait_for_cloud(monitor, odom, lidar)}\n")
     if args.trajectory:
         source = f"  Trajectory: {args.trajectory} (sha256 {digest[:12]}), open loop\n"
         rate = args.rate
@@ -918,6 +1047,16 @@ def bounded(low, high):
             raise argparse.ArgumentTypeError(f"must be between {low:g} and {high:g}")
         return value
     return parse
+
+
+def float_list(text):
+    try:
+        values = tuple(float(v) for v in text.split(",") if v.strip())
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be numbers separated by commas") from None
+    if not values:
+        raise argparse.ArgumentTypeError("needs at least one number")
+    return values
 
 
 def parse_args():
@@ -950,6 +1089,39 @@ def parse_args():
                         type=bounded(0.05, 0.5), const=0.27,
                         help="feed body velocity 0 and this base height in meters (if none is given: "
                              "%(const)s) instead of refusing a policy that reads them")
+    parser.add_argument("--env-source", choices=("flat", "lidar"), default="flat",
+                        help="where the policy's env vector comes from: flat = open, flat floor; lidar = "
+                             "go2/lidar_env.py from the lidar's cloud (default: %(default)s)")
+    parser.add_argument("--env-mode", choices=("terrain", "obstacle_bearing"), default="terrain",
+                        help="S-M-ICRL's probe_mode for the policy's task; walk is terrain, push_box is "
+                             "obstacle_bearing (default: %(default)s)")
+    parser.add_argument("--probe-ahead", type=float, default=0.30,
+                        help="terrain mode: probe_ahead from the task config (default: %(default)s)")
+    parser.add_argument("--probe-lateral", type=float_list, default=(0.15, 0.0, -0.15), metavar="LIST",
+                        help="terrain mode: probe_lateral, comma-separated, left to right (default: 0.15,0,-0.15)")
+    parser.add_argument("--probe-bearings", type=float_list, default=(30.0, 0.0, -30.0), metavar="LIST",
+                        help="obstacle_bearing mode: probe_bearings_deg, comma-separated, left to right "
+                             "(default: 30,0,-30; push_box_turn uses 30,20,10,0,-10,-20,-30)")
+    parser.add_argument("--probe-range", type=float, default=2.0, help="obstacle_bearing mode (default: %(default)s)")
+    parser.add_argument("--probe-sector", type=float, default=40.0, metavar="DEG",
+                        help="obstacle_bearing mode: probe_sector_deg (default: %(default)s)")
+    parser.add_argument("--probe-rays", type=int, default=5,
+                        help="obstacle_bearing mode: probe_rays_per_sector (default: %(default)s)")
+    parser.add_argument("--env-hz", type=bounded(1.0, 500.0), default=ENV_HZ,
+                        help="with --env-source lidar, how often the env vector is rebuilt, as S-M-ICRL's env_hz "
+                             "(default: %(default)s)")
+    parser.add_argument("--lidar-topic", choices=sorted(LIDAR_TOPICS), default="cloud",
+                        help="with --env-source lidar: cloud (rt/utlidar/cloud, needs the mount) or cloud_deskewed "
+                             "(needs rt/utlidar/robot_odom, which stops once sport mode is off) (default: %(default)s)")
+    parser.add_argument("--lidar-mount", dest="lidar_mount_file", type=Path, default=MOUNT_FILE, metavar="FILE",
+                        help="the lidar's mount on the body, from go2/lidar_calibrate.py "
+                             "(default: go2/logs/lidar_mount.json)")
+    parser.add_argument("--lidar-window", type=bounded(0.0, 2.0), default=CLOUD_WINDOW_S, metavar="SECONDS",
+                        help="with --env-source lidar, trace the rays through the clouds of this many seconds "
+                             "together, turned by the IMU's yaw; 0 = the newest cloud only (default: %(default)s)")
+    parser.add_argument("--max-cloud-age", type=bounded(0.05, 5.0), default=MAX_CLOUD_AGE,
+                        help="with --env-source lidar, stop if the newest usable cloud is older than this many "
+                             "seconds (default: %(default)s)")
     parser.add_argument("--sport-mode", default=SPORT_MODE, metavar="NAME",
                         help="the sport mode to switch back to after the run, if the robot was already in "
                              "low-level mode when the run started (default: %(default)s); otherwise it "
@@ -965,6 +1137,15 @@ def parse_args():
         parser.error("--rate goes with --trajectory, and --trajectory needs it")
     if args.trajectory and args.fill_height is not None:
         parser.error("--fill-unmeasured only applies to policies")
+    if args.trajectory and args.env_source == "lidar":
+        parser.error("--env-source lidar only applies to policies")
+    args.layout = EnvLayout(mode=args.env_mode, probe_ahead=args.probe_ahead, probe_lateral=args.probe_lateral,
+                            probe_bearings_deg=args.probe_bearings, probe_range=args.probe_range,
+                            probe_sector_deg=args.probe_sector, probe_rays_per_sector=args.probe_rays)
+    try:
+        args.lidar_mount = load_mount(args.lidar_mount_file)
+    except (OSError, ValueError, KeyError) as error:
+        parser.error(f"--lidar-mount {args.lidar_mount_file}: {error}")
     return args
 
 
@@ -972,8 +1153,12 @@ def main():
     args = parse_args()
     signal.signal(signal.SIGALRM, _on_watchdog)
     signal.signal(signal.SIGTERM, _on_terminate)
-    env = flat_floor_env(args.probe_height)
+    env = args.layout.open_floor(args.probe_height)
+    log_path = args.log or Path(__file__).resolve().parent / "logs" / f"{datetime.now():%Y-%m-%d_%H-%M-%S}.npz"
+    args.lidar_log = log_path.with_name(log_path.stem + "_lidar.npz")  # go2/lidar_worker.py's readings
     original_mode = None
+    lidar = None
+    commanding = False
     try:
         if args.trajectory:
             rows, digest = prepare_trajectory(args.trajectory, args.rate)
@@ -989,38 +1174,68 @@ def main():
             if args.check:
                 print(f"Policy OK: {args.policy}", flush=True)
                 return 0
-        monitor, subscriber, odom = connect(args)
+        monitor, subscriber, odom, lidar = connect(args)
         if args.dry_run:
             if args.trajectory:
                 dry_run(monitor, args.seconds, args.rate,
                         lambda elapsed, state: trajectory_target(rows, args.rate, elapsed))
             else:
                 start_yaw = read_state(monitor.msg).rpy[2]
-                dry_run(monitor, args.seconds, args.policy_hz, lambda elapsed, state: policy_target(
-                    policy, build_robot_state(state, start_yaw, args.fill_height), env))
+                if lidar is not None:
+                    print(f"Lidar: {wait_for_cloud(monitor, odom, lidar)}", flush=True)
+                next_print = [0.0]
+
+                def target_at(elapsed, state):
+                    live = env
+                    if lidar is not None:
+                        now = time.perf_counter()
+                        lidar.poll(now, state.rpy, odom.latest_pose(now))
+                        built = lidar.build(now, args.probe_height)
+                        if built is None:
+                            raise Fault(f"no usable lidar cloud: {lidar.status(now)}")
+                        live = built[0]
+                        if elapsed >= next_print[0]:
+                            next_print[0] += 1.0
+                            print(f"  lidar env {np.array2string(live, precision=2, suppress_small=True)}  "
+                                  f"({lidar.status(now)})", flush=True)
+                    return policy_target(policy, build_robot_state(state, start_yaw, args.fill_height), live)
+
+                dry_run(monitor, args.seconds, args.policy_hz, target_at)
             return 0
         if args.robot:
-            original_mode = prepare_robot(args, monitor, digest)
+            original_mode = prepare_robot(args, monitor, digest, odom, lidar)
+        commanding = True
     except (Refused, Fault) as error:
         print(f"REFUSED: {error}", flush=True)
         return 2
     except KeyboardInterrupt:
         print("Stopped before sending any low-level commands.", flush=True)
         return 2
+    finally:
+        if lidar is not None and not commanding:
+            lidar.stop()  # its readings file shows what the lidar sent
 
     publisher = ChannelPublisher("rt/lowcmd", LowCmd_)
     publisher.Init()
     controller = Controller(monitor, publisher, args.kp, args.kd, args.torque_fraction)
+    controller.odom = odom
+    controller.lidar = lidar
+    controller.probe_height = args.probe_height
     outcome = "finished"
     status = 0
+    # A full collection over the growing log stalled the 500 Hz loop for 25 ms mid-walk.
+    # Reference counting still frees everything here but cycles, so it waits until after damping.
+    gc.disable()
     try:
         if args.trajectory:
             def motion():
                 controller.play(rows, args.rate, args.seconds)
         else:
             def motion():
-                controller.walk(policy, env, args.policy_hz, args.seconds, args.fill_height)
+                controller.walk(policy, env, args.policy_hz, args.seconds, args.fill_height, args.env_hz)
         controller.run_sequence(motion, args.seconds, ask_before_walking=bool(args.robot))
+        if controller.not_walked:
+            outcome, status = f"not walked: {controller.not_walked}", 1
     except Fault as fault:
         outcome, status = f"FAULT: {fault}", 1
     except KeyboardInterrupt:
@@ -1038,14 +1253,17 @@ def main():
         except Exception:
             traceback.print_exc()
             outcome, status = f"{outcome}; DAMPING FAILED", 1
+        gc.enable()
 
-    log_path = args.log or Path(__file__).resolve().parent / "logs" / f"{datetime.now():%Y-%m-%d_%H-%M-%S}.npz"
+    if lidar is not None:
+        lidar.stop()  # it writes its readings file now
     saved = controller.save_log(log_path, {
         "policy": args.policy and str(args.policy),
         "trajectory": args.trajectory and str(args.trajectory), "rate": args.rate, "sha256": digest, "outcome": outcome, "interface": args.robot or "lo",
         "policy_hz": args.policy_hz, "kp": args.kp, "kd": args.kd, "seconds": args.seconds,
         "torque_fraction": args.torque_fraction, "probe_height": args.probe_height,
-        "fill_height": args.fill_height,
+        "fill_height": args.fill_height, "env_source": args.env_source, "env_layout": args.layout.as_dict(),
+        "env_hz": args.env_hz,
         "original_mode": original_mode,
         # "t" counts from this time.perf_counter() reading, so other programs' times,
         # such as go2/phone_camera.py's, can be matched to the log.

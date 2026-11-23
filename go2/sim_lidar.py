@@ -10,11 +10,25 @@ robot. The rays stop at the first thing they hit, so the floor behind a raised
 surface is hidden from them, as it can be from a real lidar. A ring of level and
 upward rays is also cast, so that the sides of things taller than the lidar show up
 (the floor grid alone only reaches the part of an object below the lidar).
+
+The rays are cast and the messages sent by this file run as a process of its own,
+from a copy of the pose taken when a publish is due. Writing the clouds holds the
+Python interpreter for 5-7 ms each, so done in the simulator's process it held back
+rt/lowstate by up to 29 ms, and run_policy.py walks that run cleanly without --lidar
+tripped its joint speed stop. The simulator sends it the model, then the poses, down
+its stdin; it stops when that closes.
 """
+import os
+import pickle
+import signal
+import struct
+import subprocess
+import sys
+
 import mujoco
 import numpy as np
 
-from unitree_sdk2py.core.channel import ChannelPublisher
+from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelPublisher
 from unitree_sdk2py.idl.default import (
     nav_msgs_msg_dds__Odometry_,
     std_msgs_msg_dds__Header_,
@@ -36,12 +50,80 @@ POINT_FLOAT32 = 7  # sensor_msgs PointField FLOAT32
 RING_AZIMUTHS = np.radians(np.arange(0.0, 360.0, 2.0))
 RING_ELEVATIONS = np.radians(np.arange(-30.0, 46.0, 3.0))
 WORLD_GEOMS_ONLY = np.array([1, 0, 0, 0, 0, 0], dtype=np.uint8)  # the robot's geoms are in groups 2 and 3
+SIZE = struct.Struct("<Q")
 
 
 class SimLidar:
-    def __init__(self, model, data):
-        self._model, self._data = model, data
+    """The simulator's side: starts the publisher and hands it the pose when a publish is due."""
+
+    def __init__(self, model, data, domain):
+        self._data = data
         self._next_publish = 0.0
+        # Its own session, so Ctrl-C in the simulator's terminal reaches only the simulator.
+        process = subprocess.Popen([sys.executable, __file__, str(domain)], stdin=subprocess.PIPE,
+                                   start_new_session=True)
+        model_bytes = pickle.dumps(model)
+        process.stdin.write(SIZE.pack(len(model_bytes)) + model_bytes)
+        process.stdin.flush()
+        self._pipe = process.stdin.fileno()
+        self._process = process  # keeps the pipe open
+        os.set_blocking(self._pipe, False)
+        self._pose = struct.Struct(f"<{1 + model.nq}d")  # sim time, qpos; under PIPE_BUF, so written whole
+
+    def step(self):
+        """Hand over the pose if a publish is due. Call from the thread that steps the physics."""
+        if self._data.time < self._next_publish or self._pipe is None:
+            return
+        self._next_publish = self._data.time + 1.0 / RATE
+        try:
+            os.write(self._pipe, self._pose.pack(self._data.time, *self._data.qpos))
+        except BlockingIOError:
+            pass  # the publisher is behind: it gets the next pose instead
+        except OSError:
+            self._pipe = None  # it has stopped, and said why on this terminal; the simulation goes on
+
+
+def _read_exactly(fd, size):
+    data = b""
+    while len(data) < size:
+        chunk = os.read(fd, size - len(data))
+        if not chunk:
+            return None
+        data += chunk
+    return data
+
+
+def _publish_from_pipe(domain):
+    """The publisher process: pose a copy of the model from the newest pose, cast and publish."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    fd = sys.stdin.fileno()
+    header = _read_exactly(fd, SIZE.size)
+    if header is None:
+        return
+    model = pickle.loads(_read_exactly(fd, SIZE.unpack(header)[0]))
+    pose = struct.Struct(f"<{1 + model.nq}d")
+    ChannelFactoryInitialize(domain, "lo")
+    publisher = _Publisher(model)
+    data = mujoco.MjData(model)
+    pending = b""
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            return  # the simulator has stopped
+        pending += chunk
+        whole = len(pending) // pose.size
+        if whole == 0:
+            continue
+        values = pose.unpack(pending[(whole - 1) * pose.size:whole * pose.size])  # the newest only
+        pending = pending[whole * pose.size:]
+        data.qpos[:] = values[1:]
+        mujoco.mj_kinematics(model, data)
+        publisher.publish(values[0], data)
+
+
+class _Publisher:
+    def __init__(self, model):
+        self._model = model
         self._odom = ChannelPublisher("rt/utlidar/robot_odom", Odometry_)
         self._state = ChannelPublisher("rt/utlidar/lidar_state", LidarState_)
         self._clouds = [ChannelPublisher(topic, PointCloud2_)
@@ -61,32 +143,26 @@ class SimLidar:
         self._geoms = np.zeros(rays, dtype=np.int32)
         self._distances = np.zeros(rays)
 
-    def step(self):
-        """Publish if it's time to. Call from the thread that steps the physics."""
-        if self._data.time < self._next_publish:
-            return
-        self._next_publish = self._data.time + 1.0 / RATE
-
-        origin = self._grid_origin()
-        points = self._cast_rays(origin)
-        stamp = self._data.time
-        self._odom.Write(self._odom_message(stamp))
+    def publish(self, stamp, data):
+        origin = self._grid_origin(data)
+        points = self._cast_rays(origin, data)
+        self._odom.Write(odom_message(stamp, data.qpos))
         self._state.Write(self._state_message(stamp, len(points)))
         cloud = self._cloud_message(stamp, points)
         for publisher in self._clouds:
             publisher.Write(cloud)
         self._map.Write(self._map_message(stamp, origin, points))
 
-    def _grid_origin(self):
+    def _grid_origin(self, data):
         """Return the grid's corner, on whole cells so that cells stay put as the robot moves."""
         half_width = (GRID_CELLS - 1) * RESOLUTION / 2.0
-        return np.round((self._data.qpos[:2] - half_width) / RESOLUTION) * RESOLUTION
+        return np.round((data.qpos[:2] - half_width) / RESOLUTION) * RESOLUTION
 
-    def _cast_rays(self, origin):
+    def _cast_rays(self, origin, data):
         """Return the world x, y, z of everything the rays hit, as an (N, 3) array."""
         lidar = np.zeros(3)
-        mujoco.mju_rotVecQuat(lidar, MOUNT, self._data.qpos[3:7])
-        lidar += self._data.qpos[:3]
+        mujoco.mju_rotVecQuat(lidar, MOUNT, data.qpos[3:7])
+        lidar += data.qpos[:3]
 
         directions = self._directions.reshape(-1, 3)
         grid = directions[: GRID_CELLS * GRID_CELLS]
@@ -95,29 +171,13 @@ class SimLidar:
         grid[:, 2] = -lidar[2]
         grid /= np.linalg.norm(grid, axis=1, keepdims=True)
         rotation = np.zeros(9)
-        mujoco.mju_quat2Mat(rotation, self._data.qpos[3:7])
+        mujoco.mju_quat2Mat(rotation, data.qpos[3:7])
         directions[GRID_CELLS * GRID_CELLS:] = self._ring @ rotation.reshape(3, 3).T
 
-        mujoco.mj_multiRay(self._model, self._data, lidar, self._directions, WORLD_GEOMS_ONLY, True, -1,
+        mujoco.mj_multiRay(self._model, data, lidar, self._directions, WORLD_GEOMS_ONLY, True, -1,
                            self._geoms, self._distances, None, len(self._geoms), mujoco.mjMAXVAL)
         hit = self._geoms >= 0
         return lidar + directions[hit] * self._distances[hit, None]
-
-    def _header(self, stamp):
-        header = std_msgs_msg_dds__Header_()
-        header.stamp.sec = int(stamp)
-        header.stamp.nanosec = int((stamp - int(stamp)) * 1e9)
-        header.frame_id = FRAME
-        return header
-
-    def _odom_message(self, stamp):
-        msg = nav_msgs_msg_dds__Odometry_()
-        msg.header = self._header(stamp)
-        msg.child_frame_id = "base_link"
-        position, orientation = msg.pose.pose.position, msg.pose.pose.orientation
-        position.x, position.y, position.z = (float(value) for value in self._data.qpos[:3])
-        orientation.w, orientation.x, orientation.y, orientation.z = (float(value) for value in self._data.qpos[3:7])
-        return msg
 
     def _state_message(self, stamp, num_points):
         msg = unitree_go_msg_dds__LidarState_()
@@ -130,7 +190,7 @@ class SimLidar:
     def _cloud_message(self, stamp, points):
         fields = [PointField_(axis, 4 * i, POINT_FLOAT32, 1) for i, axis in enumerate("xyz")]
         data = list(points.astype("<f4").tobytes())
-        return PointCloud2_(self._header(stamp), 1, len(points), fields, False, 12, 12 * len(points), data, True)
+        return PointCloud2_(header(stamp), 1, len(points), fields, False, 12, 12 * len(points), data, True)
 
     def _map_message(self, stamp, origin, points):
         """Keep the highest point in each cell."""
@@ -149,6 +209,24 @@ class SimLidar:
         msg.origin = [float(origin[0]), float(origin[1])]
         msg.data = heights.tolist()
         return msg
+
+
+def header(stamp):
+    msg = std_msgs_msg_dds__Header_()
+    msg.stamp.sec = int(stamp)
+    msg.stamp.nanosec = int((stamp - int(stamp)) * 1e9)
+    msg.frame_id = FRAME
+    return msg
+
+
+def odom_message(stamp, qpos):
+    msg = nav_msgs_msg_dds__Odometry_()
+    msg.header = header(stamp)
+    msg.child_frame_id = "base_link"
+    position, orientation = msg.pose.pose.position, msg.pose.pose.orientation
+    position.x, position.y, position.z = (float(value) for value in qpos[:3])
+    orientation.w, orientation.x, orientation.y, orientation.z = (float(value) for value in qpos[3:7])
+    return msg
 
 
 ODOM_ONLY_RATE = 50.0  # Hz
@@ -172,6 +250,8 @@ class SimOdom:
         if self._data.time < self._next_publish:
             return
         self._next_publish = self._data.time + 1.0 / ODOM_ONLY_RATE
-        self._odom.Write(SimLidar._odom_message(self, self._data.time))
+        self._odom.Write(odom_message(self._data.time, self._data.qpos))
 
-    _header = SimLidar._header
+
+if __name__ == "__main__":
+    _publish_from_pipe(int(sys.argv[1]))
