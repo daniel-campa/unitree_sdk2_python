@@ -88,10 +88,8 @@ KP, KD = 80.0, 4.0
 PROBE_HEIGHT = 0.262
 ENV_HZ = 25.0  # S-M-ICRL's env_hz in the Go2 walk configs
 
-# The lidar, read in a process of its own (go2/lidar_worker.py, go2/lidar_env.py).
-# rt/utlidar/cloud_deskewed is in the odom frame, which needs rt/utlidar/robot_odom,
-# and that stops once sport mode is released; rt/utlidar/cloud is in the lidar's own
-# frame and needs only the mount.
+# cloud_deskewed is placed with rt/utlidar/robot_odom, which stops once sport mode is off;
+# cloud needs only the lidar's mount.
 LIDAR_TOPICS = {"cloud": "rt/utlidar/cloud", "cloud_deskewed": "rt/utlidar/cloud_deskewed"}
 MAX_CLOUD_AGE = 0.5  # s; with --env-source lidar, an older cloud stops the walk
 LIDAR_WAIT_S = 3.0  # how long --robot waits for a usable cloud before refusing
@@ -819,11 +817,27 @@ class Controller:
             print(f"  lidar process error: {m['error']}")
         if m.get("readings_saved"):
             print(f"Lidar readings: {m['readings_file']} ({m['saved_clouds']} clouds kept from the walk)")
+            since = clouds_since(self.lidar.readings_path, self.clock_start)
+            if since is not None:
+                print(f"Lidar while run_policy.py drove the motors: {since[0]} clouds ({since[1]} usable)")
         if self.env_rows:
             given = np.array([row[1] for row in self.env_rows])
             names = [f"probe{i}" for i in range(self.lidar.layout.n_probes)] + ["clearance", "object_dist", "bias"]
             print(f"Lidar env while walking, {len(given)} rebuilds: mean "
                   + ", ".join(f"{n} {v:+.3f}" for n, v in zip(names, given.mean(axis=0))))
+
+
+def clouds_since(readings_path, since):
+    """(clouds, usable clouds) that arrived from `since` on (time.perf_counter()), from go2/lidar_worker.py's readings file."""
+    try:
+        readings = np.load(readings_path)
+    except (OSError, ValueError):
+        return None
+    with readings:
+        if "arrival_t" not in readings.files:
+            return 0, 0
+        later = readings["arrival_t"] >= since
+        return int(later.sum()), int((later & readings["arrival_usable"].astype(bool)).sum())
 
 
 class OdomRecorder:

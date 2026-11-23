@@ -199,7 +199,47 @@ python go2/push_box_map.py lo --domain 1
 
 Start the check about 3 s after `stand_test.py`, once the robot is standing. Without `stand_test.py` the robot lies on the floor, so the heights are smaller, but the differences stay the same.
 
-**A PASS here says nothing about the real robot.** The simulated data has no noise, and its frames, scan pattern and lidar mount are assumptions. `rt/sportmodestate` always publishes in the simulator, so ignore the sport mode line too. The simulated lidar also slows the simulator by about 25%, so leave it off when testing policies.
+**A PASS here says nothing about the real robot.** The simulated data has no noise, and its frames, scan pattern and lidar mount are assumptions. `rt/sportmodestate` always publishes in the simulator, so ignore the sport mode line too. The simulated lidar casts its rays and sends its messages from a process of its own. From the simulator's process, writing the clouds held back `rt/lowstate` by up to 29 ms, and walks that ran cleanly without the lidar tripped the joint speed stop.
+
+### Give the policy the lidar's env vector
+
+`run_policy.py --env-source lidar` rebuilds the policy's env vector from the lidar while it runs, with S-M-ICRL's rays traced through the point cloud (`lidar_env.py`), in a process of its own (`lidar_worker.py`). S-M-ICRL's push_box_turn uses it, with its seven crate beams:
+
+```bash
+--env-source lidar --env-mode obstacle_bearing --probe-bearings=30,20,10,0,-10,-20,-30 --probe-range 4 --probe-sector 10 --probe-rays 5
+```
+
+**It hasn't driven the robot yet.** It has run in the simulator, where a turn policy found the crate and stopped on it, and on clouds recorded from the robot with sport mode off (step 3).
+
+- **Which cloud:** `rt/utlidar/cloud_deskewed` is in the `odom` frame, so placing it needs `rt/utlidar/robot_odom`, which stops once sport mode is released ([Check the odometry](#check-the-odometry)). The script reads `rt/utlidar/cloud` instead (`--lidar-topic`), which is in the lidar's own frame and needs the lidar's mount on the body, from `go2/logs/lidar_mount.json` (`--lidar-mount`).
+- **The window:** one `rt/utlidar/cloud` holds about 1,400 points, about 0.04 per square degree straight ahead, so a ray's strip on a crate 2 m away holds half a point and misses. The rays are traced through the clouds of the last 0.5 s together (`--lidar-window`), each turned to the current heading by the IMU's yaw. That suits turning on the spot; nothing corrects for the base moving.
+- **The rate:** the vector is rebuilt every 1/`--env-hz` from the newest cloud, about 15 a second on the robot, so it's about 0.1 s old. With `--robot`, the script refuses to start without a usable cloud, waiting up to 3 s with sport mode still on. The summary counts the clouds, and how many arrived while it drove the motors.
+- **The log:** `env_*` columns hold each rebuild (the vector given, its cloud's age and points), and the clouds are in `<log>_lidar.npz`.
+
+**1. Measure the mount** (read-only, with sport mode on). Stand the robot still on a flat floor, nobody within 2 m, with push_box_turn's crate (or a board at least 0.6 m wide and 0.5 m tall) straight ahead and square to it. With the crate's centre 2 m from the robot's, its face is 1.775 m away:
+
+```bash
+python go2/lidar_calibrate.py --robot "$IFACE" --wall-distance 1.775
+```
+
+It fits the floor in `rt/utlidar/cloud` for the lidar's roll, pitch and height, and finds the board for its forward offset and yaw. Without `--wall-distance`, those two come from Unitree's Go2 model. It writes the mount to `go2/logs/lidar_mount.json`, and prints push_box_turn's beams with it.
+
+The floor fit has run on the lidar recording of 2026-11-20 (calibration folder `2026-11-20_16-24-43`, no board in it): the lidar 0.33 m above the floor, tilted as in Unitree's model to within 0.6 deg but 5 cm higher than it, with the walk's terrain probes within 3 mm of the floor. That mount is in `go2/logs/lidar_mount.json` now.
+
+**2. Check the beams** (read-only, sport mode on). With the crate 2 m dead ahead, a dry run prints the env vector once a second:
+
+```bash
+python go2/run_policy.py POLICY.py --robot "$IFACE" --dry-run --seconds 10 --env-source lidar --env-mode obstacle_bearing \
+    --probe-bearings=30,20,10,0,-10,-20,-30 --probe-range 4 --probe-sector 10 --probe-rays 5
+```
+
+Beams 2-4 should read about 0.55 and `object_dist` (the ninth value) about 1.8, as in the simulator. Then put the crate 30 deg left, then right: beams 0-1, then 5-6 light. If the wrong side lights, the mount faces backwards. Nothing else within 4 m in the beams' arc should light them.
+
+**3. Check the lidar with sport mode off** (stands up and lies down). The same command with `--seconds 0` instead of `--dry-run` stands the robot up and lies it down in low-level mode. Its summary's `Lidar while run_policy.py drove the motors:` line should count about 15 usable clouds a second.
+
+In the lidar session of 2026-11-23 (`LIDAR_SESSION.md`, on the `jnana` branch), `rt/utlidar/cloud` kept publishing at about 15 Hz through every low-level stage of ten runs, and `rt/utlidar/cloud_deskewed` stopped as soon as sport mode was released. Traced with the mount above, the clouds that run kept from its walk towards a box found the box 2.8 m ahead at first and closing smoothly to 0.6 m, on the beams nearest its bearing.
+
+In the simulator, `sim_headless.py --flat --dt 0.002 --lidar --crate 0` and the same commands without `--robot` show the beams with the crate dead ahead: 0.55 on beams 2-4 and `object_dist` 1.8.
 
 ## Run a policy
 
@@ -209,7 +249,7 @@ It takes all three of S-M-ICRL's policy forms: a file that ends with `robot.simu
 
 `policies/walk_tmnxt_iter17.py` is an unchanged copy of `iter_17/code.py` from the run `walk_2026-10-27_17-37-32_TMNXT`. The script's default rate and gains (5 Hz, kp 80, kd 4) come from that run. Keep them for this policy, because the rate sets its gait and lower gains make it walk much less far. A policy from another run needs the values from that run's `config.json`.
 
-The script feeds the policy fixed flat-floor values instead of real terrain probes, so **the robot can't sense steps or obstacles**.
+By default the script feeds the policy fixed flat-floor values instead of real terrain probes, so **the robot can't sense steps or obstacles**. `--env-mode` sets the env vector's layout to the policy's task, and with `--env-source lidar` the vector comes from the lidar instead: see [Give the policy the lidar's env vector](#give-the-policy-the-lidars-env-vector). S-M-ICRL's push_box_turn does both.
 
 It refuses a policy whose output depends on body height or linear velocity (`robot_state[30:34]`), because the robot can't measure them. It checks 200 calls of the policy, so it also catches a policy that only reads them after its start-up phase. `--fill-unmeasured` feeds velocity 0 and a base height of 0.27 m instead of refusing (`--fill-unmeasured 0.25` sets another height). The policy then runs as if its body never moved, so test it that way in simulation first. A policy may keep state between calls. `--check` only loads and checks the policy, without connecting to anything. S-M-ICRL's real-robot loop uses it before each run.
 
@@ -327,6 +367,7 @@ These go straight to damping, which lets the robot sink to the ground:
 - A joint at its limit
 - No robot state for 0.1 s. An early robot run tripped this while standing, because of how the script read the state, not because of the robot. That's fixed but not yet retested on the robot. If it happens again, keep the log and note `oldest state` in the summary.
 - The control loop stalling for 0.2 s, or the policy failing
+- With `--env-source lidar`, no usable lidar cloud for `--max-cloud-age` (0.5 s). Without a fresh one when you press Enter, it doesn't start walking, and lies down as usual
 
 **Nothing protects the robot if the script is killed, the computer fails, or the cable comes out.** Stage 2 shows you what happens then.
 
@@ -449,7 +490,7 @@ S-M-ICRL's `real_robot.md` explains what the loop does with the pictures.
 
 ## Measure the walk with AprilTags
 
-Once `run_policy.py` releases sport mode, the robot reports no position: [Check the odometry](#check-the-odometry) found that `rt/utlidar/robot_odom`, `rt/utlidar/robot_pose` and `rt/sportmodestate` all stop. `tag_tracker.py` measures the walk from outside instead. The phone from [Film with a phone](#film-with-a-phone) films a tag on the robot's back and a tag on the floor, and the script works out where the robot tag was relative to the floor tag in each frame. It never talks to the robot.
+Once `run_policy.py` releases sport mode, the robot reports no position: [Check the odometry](#check-the-odometry) found that `rt/utlidar/robot_odom`, `rt/utlidar/robot_pose` and `rt/sportmodestate` all stop. `tag_tracker.py` measures the walk from outside instead. The phone from [Film with a phone](#film-with-a-phone) films a tag on the robot's back and a tag on the floor, and the script works out where the robot tag was relative to the floor tag in each frame. For push_box_turn a third tag, on the crate, is tracked the same way. It never talks to the robot.
 
 **This hasn't been tried on the robot.** With a real phone (DroidCam, 960x540 recordings), calibration passed at 0.22 px, and a tag slid by hand about 1 m along the floor measured 0.95 m, with no sideways drift, from 1.6-3 m away. Once still, it held within ±4 mm forward and ±1 cm sideways. On synthetic videos, rendered from the printed sheets with a known path and lens distortion, a 1.8 m walk measured 1.77-1.78 m, the sideways drift came within 4 cm and the turn within 1.5 deg, and calibration recovered the focal length to 0.4%.
 
@@ -463,11 +504,12 @@ S-M-ICRL's real-robot loop can score its walks from this, with `position_source:
 |---|---|---|
 | 1 | Robot tag, ID 0, black square 120 mm | Glued to stiff card, taped flat on the back between the handle and the head, centred, arrow towards the head. Not over the handle |
 | 2 | Floor tag, ID 1, black square 140 mm | Glued to stiff card, flat on the floor beside the lane on the camera's side, arrow along the lane. The robot mustn't cover it. Don't move it during a session |
-| 3 | Checkerboard, 25 mm squares | Glued flat to stiff card, for calibrating the camera |
+| 3 | Crate tag, ID 2, black square 140 mm | For push_box_turn: glued to stiff card, flat on the middle of the crate's top, face up. Its arrow can point anywhere |
+| 4 | Checkerboard, 25 mm squares | Glued flat to stiff card, for calibrating the camera |
 
 ![Where the robot tag goes: flat on the back between the handle and the head, face up, arrow towards the head](tags/tag_placement.svg)
 
-Measure each black square and each checkerboard square with a ruler. If they're not 120 mm, 140 mm and 25 mm, pass what you measured as `--robot-size-m`, `--floor-size-m` and `--square-mm`. A 2% size error becomes a 2% distance error.
+Measure each black square and each checkerboard square with a ruler. If they're not 120 mm, 140 mm, 140 mm and 25 mm, pass what you measured as `--robot-size-m`, `--floor-size-m`, `--crate-size-m` and `--square-mm`. A 2% size error becomes a 2% distance error.
 
 ### 2. Place the phone
 
@@ -499,7 +541,7 @@ Both must run on the same computer, because the times line up on its `time.perf_
 - Over the log's `walking` stage: the distance forward and left along the robot's heading at the start, and how far it turned.
 - The walk reward's distance terms per 5 s, as `check_odom.py` computes them, raw and with a 0.5 s moving average. Frame-to-frame noise counts as sideways and backward steps, so the raw number reads low. In the synthetic test it gave 12-14 where the true value was 16, and the 0.5 s average gave 15.7-16.
 
-It saves `walk_track.npz` (time, forward, left, up, yaw and tilt for each frame) and `walk_track.png`. Watch the `--annotate` video the first time: the robot tag should have a red outline, the floor tag a green one, and the floor tag's green axis should point along the lane.
+It saves `walk_track.npz` (time, forward, left, up, yaw and tilt for each frame, and the same for the crate tag as `crate_` columns, NaN where it wasn't seen) and `walk_track.png`. When the crate tag is in the picture, the report gives its median position. Watch the `--annotate` video the first time: the robot tag should have a red outline, the floor tag a green one, the crate tag a blue one, and the floor tag's green axis should point along the lane.
 
 The frame times are when frames arrived, so they lag the robot by the stream's delay. Distances over the whole walk are hardly affected, but `--latency SECONDS` takes a known delay off.
 

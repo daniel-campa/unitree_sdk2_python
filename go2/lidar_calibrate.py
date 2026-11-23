@@ -275,15 +275,10 @@ def analyse(args, clouds, imu_rpy, body_height, odom_poses):
         tx = URDF_MOUNT.xyz[0]
         wall = None
         if args.wall_distance:
-            # Try both ways round, Unitree's first: the board must come out ahead of the robot.
-            for c in choices:
-                m = Mount(frame, (0.0, 0.0, (lidar_height - h) / up[2]), tuple(c[1:3]) + (c[0],))
-                pts = np.concatenate([to_level_base(p, frame, roll, pitch, m) for p in raw])
-                found = find_wall(pts, h)
-                if found is not None:
-                    yaw, r_m, p_m, err = c
-                    wall = found
-                    break
+            # Facing forward, as in Unitree's model, only: turned round, something behind the robot
+            # can pass for the board.
+            m = Mount(frame, (0.0, 0.0, (lidar_height - h) / up[2]), (r_m, p_m, yaw))
+            wall = find_wall(np.concatenate([to_level_base(p, frame, roll, pitch, m) for p in raw]), h)
             if wall is None:
                 results["wall"] = f"no board found {WALL_HALF_WIDTH} m either side of straight ahead"
             else:
@@ -348,6 +343,8 @@ def verdict(results, mount, problem):
                      f"rpy {[round(math.degrees(v), 2) for v in mount.rpy]} deg; measured {mount.measured}")
     if results.get("mount_note"):
         lines.append(f"Note: {results['mount_note']}")
+    if isinstance(results.get("wall"), str):
+        lines.append(f"Board: {results['wall']}")
     ok = True
     errs = check.get("probe_error_m")
     if errs is None:
