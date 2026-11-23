@@ -41,7 +41,9 @@ parser.add_argument("--odom", action="store_true",
 parser.add_argument("--box", action="store_true",
                     help="add a 10 cm box ahead and to the left of the robot, like the README's lidar test")
 parser.add_argument("--crate", type=float, metavar="DEG",
-                    help="add push_box_turn's 0.45 m crate, fixed, 2 m from the robot at this bearing (+ = left)")
+                    help="add push_box_turn's 0.45 m crate, fixed, --crate-distance from the robot at this bearing (+ = left)")
+parser.add_argument("--crate-distance", type=float, default=2.0, metavar="M",
+                    help="how far the crate's centre is from the robot (default: %(default)s)")
 args = parser.parse_args()
 if args.lidar and args.odom:
     parser.error("--lidar already publishes rt/utlidar/robot_odom, so leave out --odom")
@@ -75,7 +77,7 @@ if args.box or args.crate is not None:
         # S-M-ICRL's scene_push_box_v2.xml crate, at push_box_start_x and turned to face the robot.
         bearing = math.radians(args.crate)
         spec.worldbody.add_geom(name=CRATE_NAME, type=mujoco.mjtGeom.mjGEOM_BOX,
-                                pos=[2.0 * math.cos(bearing), 2.0 * math.sin(bearing), 0.225],
+                                pos=[args.crate_distance * math.cos(bearing), args.crate_distance * math.sin(bearing), 0.225],
                                 quat=[math.cos(bearing / 2), 0.0, 0.0, math.sin(bearing / 2)],
                                 size=[0.225, 0.30, 0.225], rgba=[0.7, 0.5, 0.3, 1.0])
     model = spec.compile()

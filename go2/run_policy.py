@@ -1121,6 +1121,9 @@ def parse_args():
                         help="obstacle_bearing mode: probe_sector_deg (default: %(default)s)")
     parser.add_argument("--probe-rays", type=int, default=5,
                         help="obstacle_bearing mode: probe_rays_per_sector (default: %(default)s)")
+    parser.add_argument("--object-range", type=float, metavar="M",
+                        help="obstacle_bearing mode: object_dist reads at most this, as S-M-ICRL's env.object_range "
+                             "(default: 10, the ray's length)")
     parser.add_argument("--env-hz", type=bounded(1.0, 500.0), default=ENV_HZ,
                         help="with --env-source lidar, how often the env vector is rebuilt, as S-M-ICRL's env_hz "
                              "(default: %(default)s)")
@@ -1155,7 +1158,8 @@ def parse_args():
         parser.error("--env-source lidar only applies to policies")
     args.layout = EnvLayout(mode=args.env_mode, probe_ahead=args.probe_ahead, probe_lateral=args.probe_lateral,
                             probe_bearings_deg=args.probe_bearings, probe_range=args.probe_range,
-                            probe_sector_deg=args.probe_sector, probe_rays_per_sector=args.probe_rays)
+                            probe_sector_deg=args.probe_sector, probe_rays_per_sector=args.probe_rays,
+                            object_range=args.object_range)
     try:
         args.lidar_mount = load_mount(args.lidar_mount_file)
     except (OSError, ValueError, KeyError) as error:
@@ -1237,8 +1241,7 @@ def main():
     controller.probe_height = args.probe_height
     outcome = "finished"
     status = 0
-    # A full collection over the growing log stalled the 500 Hz loop for 25 ms mid-walk.
-    # Reference counting still frees everything here but cycles, so it waits until after damping.
+    # A full collection of the growing log stalls the 500 Hz loop for ~25 ms; refcounting frees all but cycles.
     gc.disable()
     try:
         if args.trajectory:

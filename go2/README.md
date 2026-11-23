@@ -170,6 +170,8 @@ In S-M-ICRL each beam is a 10° fan of 5 near-level rays, with fans at bearings 
 - **Robot's own body:** if the map shows the robot itself, the beams will read close to 1 with nothing in front. `--skip 0.35` ignores the first 0.35 m of every ray.
 - **Map size:** the beams reach 4 m, so a map smaller than that cuts them short. Beyond its edge they read as empty, and `known %` drops.
 
+S-M-ICRL's `push_box_turn_real.yaml` halves the range to 2 m and puts the crate 1 m away, to fit indoors: pass `--probe-range 2` for it. Its crate dead ahead lights beams 1-5 at about 0.6.
+
 Runs to do, with the robot standing still and the crate (or a box of about the same size) 2 m away:
 
 1. **Crate dead ahead.** Beams 2-4 should light, about 0.56.
@@ -189,7 +191,7 @@ python go2/stand_test.py --hold 15
 python go2/check_lidar.py lo --domain 1 --seconds 5
 ```
 
-For `push_box_map.py`, use `--crate DEG` instead of `--box`. It puts a fixed crate 2 m away at that bearing (+ is left):
+For `push_box_map.py`, use `--crate DEG` instead of `--box`. It puts a fixed crate 2 m away at that bearing (+ is left), or `--crate-distance` away:
 
 ```bash
 python go2/sim_headless.py --flat --lidar --crate 15
@@ -206,8 +208,10 @@ Start the check about 3 s after `stand_test.py`, once the robot is standing. Wit
 `run_policy.py --env-source lidar` rebuilds the policy's env vector from the lidar while it runs, with S-M-ICRL's rays traced through the point cloud (`lidar_env.py`), in a process of its own (`lidar_worker.py`). S-M-ICRL's push_box_turn uses it, with its seven crate beams:
 
 ```bash
---env-source lidar --env-mode obstacle_bearing --probe-bearings=30,20,10,0,-10,-20,-30 --probe-range 4 --probe-sector 10 --probe-rays 5
+--env-source lidar --env-mode obstacle_bearing --probe-bearings=30,20,10,0,-10,-20,-30 --probe-range 2 --probe-sector 10 --probe-rays 5 --object-range 2
 ```
+
+These are `push_box_turn_real.yaml`'s: push_box_turn's beams at half its 4 m range, with the crate 1 m away instead of 2 m, to fit indoors. `--object-range 2` caps `object_dist` at the beams' range, as S-M-ICRL does, so walls further away don't show in it.
 
 **It hasn't driven the robot yet.** It has run in the simulator, where a turn policy found the crate and stopped on it, and on clouds recorded from the robot with sport mode off (step 3).
 
@@ -216,30 +220,30 @@ Start the check about 3 s after `stand_test.py`, once the robot is standing. Wit
 - **The rate:** the vector is rebuilt every 1/`--env-hz` from the newest cloud, about 15 a second on the robot, so it's about 0.1 s old. With `--robot`, the script refuses to start without a usable cloud, waiting up to 3 s with sport mode still on. The summary counts the clouds, and how many arrived while it drove the motors.
 - **The log:** `env_*` columns hold each rebuild (the vector given, its cloud's age and points), and the clouds are in `<log>_lidar.npz`.
 
-**1. Measure the mount** (read-only, with sport mode on). Stand the robot still on a flat floor, nobody within 2 m, with push_box_turn's crate (or a board at least 0.6 m wide and 0.5 m tall) straight ahead and square to it. With the crate's centre 2 m from the robot's, its face is 1.775 m away:
+**1. Measure the mount** (read-only, with sport mode on). Stand the robot still on a flat floor, nobody within 2 m, with push_box_turn's crate (or a board at least 0.6 m wide and 0.5 m tall) straight ahead and square to it. With the crate's centre 1 m from the robot's, its face is 0.775 m away:
 
 ```bash
-python go2/lidar_calibrate.py --robot "$IFACE" --wall-distance 1.775
+python go2/lidar_calibrate.py --robot "$IFACE" --wall-distance 0.775
 ```
 
 It fits the floor in `rt/utlidar/cloud` for the lidar's roll, pitch and height, and finds the board for its forward offset and yaw. Without `--wall-distance`, those two come from Unitree's Go2 model. It writes the mount to `go2/logs/lidar_mount.json`, and prints push_box_turn's beams with it.
 
 The floor fit has run on the lidar recording of 2026-11-20 (calibration folder `2026-11-20_16-24-43`, no board in it): the lidar 0.33 m above the floor, tilted as in Unitree's model to within 0.6 deg but 5 cm higher than it, with the walk's terrain probes within 3 mm of the floor. That mount is in `go2/logs/lidar_mount.json` now.
 
-**2. Check the beams** (read-only, sport mode on). With the crate 2 m dead ahead, a dry run prints the env vector once a second:
+**2. Check the beams** (read-only, sport mode on). With the crate 1 m dead ahead, a dry run prints the env vector once a second:
 
 ```bash
 python go2/run_policy.py POLICY.py --robot "$IFACE" --dry-run --seconds 10 --env-source lidar --env-mode obstacle_bearing \
-    --probe-bearings=30,20,10,0,-10,-20,-30 --probe-range 4 --probe-sector 10 --probe-rays 5
+    --probe-bearings=30,20,10,0,-10,-20,-30 --probe-range 2 --probe-sector 10 --probe-rays 5 --object-range 2
 ```
 
-Beams 2-4 should read about 0.55 and `object_dist` (the ninth value) about 1.8, as in the simulator. Then put the crate 30 deg left, then right: beams 0-1, then 5-6 light. If the wrong side lights, the mount faces backwards. Nothing else within 4 m in the beams' arc should light them.
+Beams 1-5 should read about 0.6 and `object_dist` (the ninth value) about 0.8, as in S-M-ICRL's simulation. Then put the crate 0.5 m to the left, then the right, still 1 m ahead: beams 0-2, then 4-6 light. If the wrong side lights, the mount faces backwards. Nothing else within 2 m in the beams' arc should light them.
 
 **3. Check the lidar with sport mode off** (stands up and lies down). The same command with `--seconds 0` instead of `--dry-run` stands the robot up and lies it down in low-level mode. Its summary's `Lidar while run_policy.py drove the motors:` line should count about 15 usable clouds a second.
 
 In the lidar session of 2026-11-23 (`LIDAR_SESSION.md`, on the `jnana` branch), `rt/utlidar/cloud` kept publishing at about 15 Hz through every low-level stage of ten runs, and `rt/utlidar/cloud_deskewed` stopped as soon as sport mode was released. Traced with the mount above, the clouds that run kept from its walk towards a box found the box 2.8 m ahead at first and closing smoothly to 0.6 m, on the beams nearest its bearing.
 
-In the simulator, `sim_headless.py --flat --dt 0.002 --lidar --crate 0` and the same commands without `--robot` show the beams with the crate dead ahead: 0.55 on beams 2-4 and `object_dist` 1.8.
+In the simulator, `sim_headless.py --flat --dt 0.002 --lidar --crate 0 --crate-distance 1` and the same commands without `--robot` show the beams with the crate dead ahead: 0.57-0.58 on beams 1-5 and `object_dist` 0.84.
 
 ## Run a policy
 

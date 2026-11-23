@@ -29,12 +29,11 @@ Where the lidar has no points (a probe spot in its blind zone, say), a value fal
 back to what S-M-ICRL would read on open, flat floor, and the reading says which
 values fell back.
 
-One rt/utlidar/cloud message is too sparse for the rays: about 0.04 points per square
-degree straight ahead (the robot, 2026-11-20), so a ray's strip on a crate 2 m out holds
-about half a point, and a hit needs RAY_MIN_POINTS. CloudEnv can therefore trace the
-rays through the clouds of the last `window` seconds together. The older clouds are
-turned to the newest one's heading by the IMU's yaw. Nothing corrects for the base
-moving, which is right for turning on the spot.
+One rt/utlidar/cloud message is too sparse for the rays: a ray's strip on a crate 2 m
+out holds about half a point, and a hit needs RAY_MIN_POINTS. So CloudEnv can trace them
+through the last `window` seconds of clouds, the older ones turned to the newest one's
+heading by the IMU's yaw. Nothing corrects for the base moving, which suits turning on
+the spot.
 """
 import json
 import math
@@ -50,7 +49,7 @@ WORLD_FRAMES = {"odom", "map", "world"}
 BODY_FRAMES = {"base", "base_link", "body", "trunk"}
 # go2/lidar_calibrate.py writes the measured mount here, and go2/run_policy.py reads it.
 MOUNT_FILE = Path(__file__).resolve().parent / "logs" / "lidar_mount.json"
-CLOUD_WINDOW_S = 0.5  # go2/run_policy.py's default window: see CloudEnv
+CLOUD_WINDOW_S = 0.5  # the default window of go2/run_policy.py and go2/lidar_calibrate.py
 POINT_FIELD_FORMATS = {7: "f4", 8: "f8"}  # sensor_msgs PointField FLOAT32, FLOAT64
 
 # S-M-ICRL's values (world/robot_api.py).
@@ -91,6 +90,7 @@ class EnvLayout:
     probe_range: float = 2.0
     probe_sector_deg: float = 40.0
     probe_rays_per_sector: int = 5
+    object_range: float | None = None  # obstacle_bearing mode: object_dist reads at most this
 
     def __post_init__(self):
         if self.mode not in ("terrain", "obstacle_bearing"):
@@ -115,12 +115,19 @@ class EnvLayout:
     def open_floor(self, height):
         """The env vector on clear, flat floor with the base at this height: S-M-ICRL's values."""
         probes = [-height] * self.n_probes if self.mode == "terrain" else [0.0] * self.n_probes
-        return np.array([*probes, OPEN_CLEARANCE, OPEN_OBSTACLE_DISTANCE, 1.0])
+        return np.array([*probes, OPEN_CLEARANCE, self.cap(OPEN_OBSTACLE_DISTANCE), 1.0])
+
+    def cap(self, distance):
+        """object_dist as S-M-ICRL reports it: capped at object_range in obstacle_bearing mode."""
+        if self.mode == "obstacle_bearing" and self.object_range is not None:
+            return min(distance, self.object_range)
+        return distance
 
     def as_dict(self):
         return {"mode": self.mode, "probe_ahead": self.probe_ahead, "probe_lateral": list(self.probe_lateral),
                 "probe_bearings_deg": list(self.probe_bearings_deg), "probe_range": self.probe_range,
-                "probe_sector_deg": self.probe_sector_deg, "probe_rays_per_sector": self.probe_rays_per_sector}
+                "probe_sector_deg": self.probe_sector_deg, "probe_rays_per_sector": self.probe_rays_per_sector,
+                "object_range": self.object_range}
 
 
 @dataclass
@@ -286,7 +293,7 @@ def build_env(points, layout, height):
             nearest = min(found) if found else OPEN_OBSTACLE_DISTANCE
             fan_hits.append(nearest if found else None)
             env[i] = max(0.0, 1.0 - nearest / layout.probe_range)
-        env[layout.n_probes + 1] = min(r if r is not None else OPEN_OBSTACLE_DISTANCE for r in fan_hits)
+        env[layout.n_probes + 1] = layout.cap(min(r if r is not None else OPEN_OBSTACLE_DISTANCE for r in fan_hits))
 
     # Overhead: only what's higher than CEILING_CAST_FROM off the floor counts, as in S-M-ICRL.
     over = (np.hypot(points[:, 0], points[:, 1]) < CLEARANCE_RADIUS) & (points[:, 2] > CEILING_CAST_FROM - height)

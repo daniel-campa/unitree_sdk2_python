@@ -11,12 +11,10 @@ surface is hidden from them, as it can be from a real lidar. A ring of level and
 upward rays is also cast, so that the sides of things taller than the lidar show up
 (the floor grid alone only reaches the part of an object below the lidar).
 
-The rays are cast and the messages sent by this file run as a process of its own,
-from a copy of the pose taken when a publish is due. Writing the clouds holds the
-Python interpreter for 5-7 ms each, so done in the simulator's process it held back
-rt/lowstate by up to 29 ms, and run_policy.py walks that run cleanly without --lidar
-tripped its joint speed stop. The simulator sends it the model, then the poses, down
-its stdin; it stops when that closes.
+The rays are cast and the messages sent by this file run as a process of its own: each
+cloud write holds the Python interpreter for 5-7 ms, and in the simulator's process that
+held back rt/lowstate enough to trip run_policy.py's joint speed stop. The simulator
+sends it the model, then a pose per publish, down its stdin; it stops when that closes.
 """
 import os
 import pickle

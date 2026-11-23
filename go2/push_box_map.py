@@ -248,6 +248,7 @@ def show_live(figure, panels, cmap, view, height_map, odom, plt, read):
 
 
 def main():
+    global PROBE_RANGE, ZOOM_HALF_WIDTH
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("interface", nargs="?", default=DEFAULT_INTERFACE,
                         help="network interface wired to the robot (default: %(default)s)")
@@ -256,9 +257,12 @@ def main():
     parser.add_argument("--save", metavar="FILE", help="save one picture to FILE and exit, instead of opening a window")
     parser.add_argument("--base-height", type=float, metavar="M",
                         help="base height above the floor, instead of estimating the floor from the map")
+    parser.add_argument("--probe-range", type=float, default=PROBE_RANGE, metavar="M",
+                        help="a beam reads 0 beyond this; push_box_turn_real.yaml halves it to 2 (default: %(default)s)")
     parser.add_argument("--skip", type=float, default=0.0, metavar="M",
                         help="ignore the first M m of every ray, in case the map shows the robot's own body")
     args = parser.parse_args()
+    PROBE_RANGE, ZOOM_HALF_WIDTH = args.probe_range, args.probe_range + 0.3
     if args.seconds <= 0.0:
         parser.error("--seconds must be positive")
     if not 0.0 <= args.skip < PROBE_RANGE:

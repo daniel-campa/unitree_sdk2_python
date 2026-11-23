@@ -5,14 +5,14 @@ This script only subscribes to topics. It creates no publishers and no SDK clien
 so it can't move the robot or switch the lidar on or off.
 
     python go2/lidar_calibrate.py --robot "$IFACE"                         # flat floor only
-    python go2/lidar_calibrate.py --robot "$IFACE" --wall-distance 1.775   # with the crate (or a board) ahead
+    python go2/lidar_calibrate.py --robot "$IFACE" --wall-distance 0.775   # with the crate (or a board) ahead
     python go2/lidar_calibrate.py                                          # go2/sim_headless.py --lidar
 
 Set-up: the robot standing still in sport mode on a flat, clear floor, nobody within
 2 m. For --wall-distance, stand a flat board (at least 0.6 m wide and 0.5 m tall), or
 push_box_turn's crate, square to the robot, straight ahead, with its face that many
 metres from the robot's centre (on the floor, midway between the front and rear feet).
-The crate's centre 2 m away puts its face at 1.775 m. Without the board, the lidar's
+The crate's centre 1 m away, as push_box_turn_real places it, puts its face at 0.775 m. Without the board, the lidar's
 forward position and which way it faces come from Unitree's Go2 model (URDF_MOUNT).
 
 It records every lidar topic for --seconds and works out:
@@ -72,8 +72,9 @@ EXPECTED_TOL = {"probe": 0.03, "object_dist": 0.05}  # m: how close the check mu
 # Unitree's Go2 model (go2_description's radar_joint): on the head, facing forward and 15 deg
 # down from upside-down. The floor fit can't tell forward from back, nor the forward offset.
 URDF_MOUNT = Mount("utlidar_lidar", (0.28945, 0.0, -0.046825), (0.0, 2.8782, 0.0))
+# S-M-ICRL's push_box_turn_real.yaml: push_box_turn's beams at half the range, for the crate 1 m away.
 PUSH_BOX_TURN = EnvLayout(mode="obstacle_bearing", probe_bearings_deg=(30, 20, 10, 0, -10, -20, -30),
-                          probe_range=4.0, probe_sector_deg=10.0, probe_rays_per_sector=5)
+                          probe_range=2.0, probe_sector_deg=10.0, probe_rays_per_sector=5, object_range=2.0)
 
 
 # --------------------------------------------------------------------------- recording
@@ -361,8 +362,8 @@ def verdict(results, mount, problem):
     beams = results.get("push_box_turn_beams")
     if beams:
         lines.append(f"push_box_turn beams +30..-30 deg: {beams['mean'][:7]}, lit in {beams['lit_share']} of windows, "
-                     f"object_dist {beams['mean'][8]:.2f} m. With the crate dead ahead 2 m away, beams 2-4 should "
-                     f"read about 0.55 and object_dist about 1.8 m")
+                     f"object_dist {beams['mean'][8]:.2f} m. With the crate dead ahead 1 m away, beams 1-5 should "
+                     f"read about 0.6 and object_dist about 0.8 m")
     return ok, lines
 
 
