@@ -12,7 +12,13 @@ Set-up: the robot standing still in sport mode on a flat, clear floor, nobody wi
 2 m. For --wall-distance, stand a flat board (at least 0.6 m wide and 0.5 m tall)
 square to the robot, straight ahead, with its face that many metres from the robot's
 centre (on the floor, midway between the front and rear feet). Without the board the
-lidar's forward position isn't measured, and its yaw is taken as 0.
+lidar's forward position isn't measured: it is taken from Unitree's Go2 model (0.289 m).
+
+The mount is fitted to the cloud in the lidar's own frame (rt/utlidar/cloud), because
+that is the one go2/run_policy.py gets once sport mode is off; the deskewed cloud (odom
+frame) stops then. Of the two ways round the floor allows (yaw 0 or 180 degrees), the
+one closer to Unitree's model is tried first, and a board only counts within
+WALL_ACCEPT m of --wall-distance, so a stray surface near the robot can't flip it.
 
 It records every lidar topic for --seconds and works out:
 
@@ -46,8 +52,9 @@ from pathlib import Path
 import numpy as np
 from check_connection import DEFAULT_INTERFACE, check_interface
 from lidar_env import (BODY_FRAMES, CLOUD_TOPICS, HEIGHT_MAP_TOPIC, LIDAR_STATE_TOPIC, OPEN_OBSTACLE_DISTANCE,
-                       RAY_START_HEIGHT, WORLD_FRAMES, EnvLayout, Mount, NoReading, build_env, cloud_frame,
-                       cloud_stamp, decode_points, rotation_rpy, to_level_base)
+                       RAY_START_HEIGHT, UNITREE_MOUNT, WORLD_FRAMES, EnvLayout, Mount, NoReading, build_env,
+                       cloud_frame, cloud_stamp, decode_points, drop_self, rotation_angle, rotation_rpy,
+                       to_level_base)
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
 from unitree_sdk2py.idl.nav_msgs.msg.dds_ import Odometry_
 from unitree_sdk2py.idl.sensor_msgs.msg.dds_ import PointCloud2_
@@ -64,6 +71,7 @@ FLOOR_TOL = 0.02  # m from the plane that counts as on the floor
 LIDAR_HEIGHT_RANGE = (0.1, 1.0)  # m: the floor must be this far from the lidar
 WALL_MIN_POINTS = 30
 WALL_HALF_WIDTH = 0.30  # m either side of straight ahead that the board is looked for in
+WALL_ACCEPT = 0.35  # m: with Unitree's model as the starting point, a board must be this close to --wall-distance
 EXPECTED_TOL = {"probe": 0.03, "object_dist": 0.05}  # m: how close the check must come
 
 
@@ -210,12 +218,13 @@ def view_in_frame(points):
 def analyse(args, clouds, imu_rpy, body_height, odom_poses):
     results = {"body_height_m": body_height, "imu_roll_pitch": [round(v, 4) for v in imu_rpy[:2]]}
     roll, pitch = imu_rpy[0], imu_rpy[1]
-    # Which topic to fit: the first, in run_policy.py's order, that has clouds.
-    for rec in clouds:
-        if rec.messages:
-            break
-    else:
+    # Which topic to fit: one in the lidar's own frame if any has clouds, because with
+    # sport mode off that is the only cloud run_policy.py gets; otherwise the first.
+    with_clouds = [rec for rec in clouds if rec.messages]
+    if not with_clouds:
         return results, None, "no lidar clouds arrived"
+    own = [rec for rec in with_clouds if cloud_frame(rec.messages[-1]) not in WORLD_FRAMES | BODY_FRAMES]
+    rec = (own or with_clouds)[0]
     frame = cloud_frame(rec.messages[-1])
     raw = [decode_points(m) for m in rec.messages]
     results["fit_topic"], results["fit_frame"] = rec.topic, frame
@@ -248,40 +257,55 @@ def analyse(args, clouds, imu_rpy, body_height, odom_poses):
                             "rms_m": round(float(np.sqrt(np.mean((sample[inliers] @ normal + lidar_height) ** 2))), 4)}
         cp, sp, cr, sr = math.cos(pitch), math.sin(pitch), math.cos(roll), math.sin(roll)
         up = np.array([-sp, cp * sr, cp * cr])  # the world's up, in the body frame
+        prior = UNITREE_MOUNT if frame == UNITREE_MOUNT.frame else None
         choices = []
         for yaw in (0.0, math.pi):
             r_m, p_m, err = mount_rotation(normal, up, yaw)
             # tz from the floor: up . t = lidar height - body height (tx is found below, if there's a board).
-            choices.append([yaw, r_m, p_m, err])
+            off = math.degrees(rotation_angle(rotation_rpy(r_m, p_m, yaw), prior.rotation())) if prior else 0.0
+            choices.append([yaw, r_m, p_m, err, off])
+        if prior:
+            choices.sort(key=lambda c: c[4])  # the way round closer to Unitree's model first
         measured = {"roll_pitch": True, "height": True, "forward": False, "yaw": False}
-        yaw, r_m, p_m, err = choices[0]
-        tx = 0.0
+        yaw, r_m, p_m, err, off = choices[0]
+        tx0 = prior.xyz[0] if prior else 0.0
+        tx = tx0
         wall = None
+        rejected = []
         if args.wall_distance:
-            # Try both ways round: the board must come out ahead of the robot.
+            # Try both ways round: the board must come out ahead of the robot, near where it was put.
             for c in choices:
-                m = Mount(frame, (0.0, 0.0, (lidar_height - h) / up[2]), tuple(c[1:3]) + (c[0],))
-                pts = np.concatenate([to_level_base(p, frame, roll, pitch, m) for p in raw])
+                tz_c = (lidar_height - h - tx0 * up[0]) / up[2]
+                m = Mount(frame, (tx0, 0.0, tz_c), (c[1], c[2], c[0]))
+                pts = drop_self(np.concatenate([to_level_base(p, frame, roll, pitch, m) for p in raw]))
                 found = find_wall(pts, h)
-                if found is not None:
-                    yaw, r_m, p_m, err = c
+                if found is not None and (prior is None or abs(found[0] - args.wall_distance) <= WALL_ACCEPT):
+                    yaw, r_m, p_m, err, off = c
                     wall = found
                     break
+                if found is not None:
+                    rejected.append({"yaw_deg": round(math.degrees(c[0])), "seen_at_m": round(found[0], 3)})
             if wall is None:
-                results["wall"] = f"no board found {WALL_HALF_WIDTH} m either side of straight ahead"
+                results["wall"] = (f"no board found {WALL_HALF_WIDTH} m either side of straight ahead"
+                                   + (f" within {WALL_ACCEPT} m of {args.wall_distance:g} m" if prior else "")
+                                   + (f" (surfaces seen but not counted: {rejected})" if rejected else ""))
             else:
-                tx = args.wall_distance - wall[0]
+                tx = tx0 + args.wall_distance - wall[0]
                 measured.update(forward=True, yaw=True)
-                results["wall"] = {"seen_at_m_before_offset": round(wall[0], 4), "points": int(len(wall[2])),
+                results["wall"] = {"seen_at_m": round(wall[0], 4), "points": int(len(wall[2])),
                                    "board_yaw_deg": round(math.degrees(wall[1]), 2),
                                    "note": "board_yaw_deg is the board's angle to the lidar; a square board "
                                            "means the lidar is turned by about minus that"}
+        if prior:
+            results["mount_vs_unitree_model_deg"] = round(off, 2)
         tz = (lidar_height - h - tx * up[0]) / up[2]
         mount = Mount(frame, (round(tx, 4), 0.0, round(float(tz), 4)), (round(r_m, 4), round(p_m, 4), yaw), measured)
         results["mount"] = mount.as_dict()
         results["mount_fit_error"] = round(err, 5)
         if not measured["forward"]:
-            results["mount_note"] = ("forward position not measured (no --wall-distance or no board): x is 0, so "
+            results["mount_note"] = ((f"forward position not measured (no --wall-distance or no board): x is "
+                                      f"{tx0:g} m, from Unitree's Go2 model") if prior else
+                                     "forward position not measured (no --wall-distance or no board): x is 0, so "
                                      "object_dist reads short by the lidar's real forward offset")
         points = [to_level_base(p, frame, roll, pitch, mount) for p in raw]
         problem = None
@@ -320,6 +344,17 @@ def verdict(results, mount, problem):
     if mount is not None:
         lines.append(f"Mount ({mount.frame!r} in the base frame): xyz {list(mount.xyz)} m, "
                      f"rpy {[round(math.degrees(v), 2) for v in mount.rpy]} deg; measured {mount.measured}")
+    if results.get("fit_topic"):
+        lines.append(f"Fitted to: {results['fit_topic']} (frame {results.get('fit_frame')!r})")
+    if results.get("mount_vs_unitree_model_deg") is not None:
+        lines.append(f"Mount vs Unitree's Go2 model: {results['mount_vs_unitree_model_deg']} deg apart "
+                     f"(expect a few degrees)")
+    wall = results.get("wall")
+    if isinstance(wall, dict):
+        lines.append(f"Board: seen at {wall['seen_at_m']} m with {wall['points']} points, "
+                     f"at {wall['board_yaw_deg']} deg to the lidar")
+    elif wall:
+        lines.append(f"Board: {wall}")
     if results.get("mount_note"):
         lines.append(f"Note: {results['mount_note']}")
     ok = True

@@ -14,8 +14,9 @@ so follow the test order in go2/README.md.
 The sequence is: stand up, hold, walk for --seconds, return to the home pose, lie
 down, then damp the motors. With --trajectory, the walk is an open-loop playback of
 the file's joint angles, interpolated between samples, after a ramp to its first
-sample. A fault, the remote's B button or Ctrl-C goes straight
-to damping. Start the simulator with `python go2/sim_headless.py --flat --dt 0.002`.
+sample. A fault or Ctrl-C goes straight to damping. The remote's B button
+does too, except while walking: then it stands the robot (SOFT_STOP_S), holds, and lies
+it down before damping; a second press of B damps at once. Start the simulator with `python go2/sim_headless.py --flat --dt 0.002`.
 
 Body velocity and height (robot_state[30:34]) and the env vector's ground probes
 come from go2/state_estimator.py by default (--no-estimate, --fill-unmeasured). With
@@ -23,7 +24,8 @@ come from go2/state_estimator.py by default (--no-estimate, --fill-unmeasured). 
 
 The env vector (S-M-ICRL's probes, clearance, object distance and bias) is open, flat
 floor unless --env-source lidar, which rebuilds it from the lidar's point cloud with
-go2/lidar_env.py, using the lidar mount that go2/lidar_calibrate.py measured. Either
+go2/lidar_env.py, using the lidar mount that go2/lidar_calibrate.py measured (or, if
+the calibration has none, the one fitted to the 2026-11-23 recording). Either
 way the lidar is read and its env vector is logged beside the one the policy got, with
 a subset of every cloud's points while walking, so a flat-floor run also records what
 the lidar saw (--no-lidar turns this off).
@@ -60,7 +62,7 @@ from typing import NamedTuple
 import numpy as np
 from check_connection import DEFAULT_INTERFACE, JOINTS, check_interface, state_problems
 from calibrate import calibration_problems, estimator_calibration, load_calibration
-from lidar_env import EnvLayout, Mount
+from lidar_env import ACCUMULATE_S, RECOVERED_MOUNT, EnvLayout, Mount
 from lidar_worker import LidarProcess
 from state_estimator import BaseEstimator
 from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient
@@ -103,6 +105,11 @@ CALIBRATION_FILE = Path(__file__).resolve().parent / "logs" / "calibration" / "l
 STAND_UP_S = 3.0
 SETTLE_S = 2.0
 RETURN_HOME_S = 1.0
+# B while walking is a soft stop: the legs go to the standing pose this quickly (shorter
+# than RETURN_HOME_S, so the robot doesn't carry on walking), it holds the stand, then
+# lies down as after a normal walk. Damping mid-stride let it fall onto the lidar.
+SOFT_STOP_S = 0.5
+SOFT_STOP_HOLD_S = 1.0
 LIE_DOWN_S = 3.0
 DAMP_S = 2.0
 DAMP_KD = 4.0
@@ -123,7 +130,7 @@ MAX_LOOP_STALL = 0.2  # s
 MAX_STAND_ERROR = 0.2  # rad; kp = 80 sags the rear hips by about 0.12 rad
 MAX_STAND_TILT = 0.2  # rad
 MAX_STAND_SPEED = 0.5  # rad/s
-MIN_BATTERY_PERCENT = 15
+MIN_BATTERY_PERCENT = 1
 
 STOP_BUTTON_MASK = 1 << 1  # B, in wireless_remote[3]; see example/wireless_controller
 POS_STOP, VEL_STOP = 2.146e9, 16000.0  # values that disable a motor's control loops
@@ -172,6 +179,10 @@ class Refused(Exception):
 
 class NotWalking(Exception):
     """A reason, found while standing, not to start the walk; the robot lies down normally."""
+
+
+class SoftStop(Exception):
+    """B was pressed while walking: stand, then lie down, instead of damping straight away."""
 
 
 class Fault(Exception):
@@ -370,9 +381,9 @@ def limit_for_torque(target, q, dq, kp, kd, torque_cap):
     return np.clip(target, q + (kd * dq - torque_cap) / kp, q + (kd * dq + torque_cap) / kp)
 
 
-def safety_problem(state, check_range):
-    """Return why this state should stop the robot, or None."""
-    if state.stop_pressed:
+def safety_problem(state, check_range, ignore_stop=False):
+    """Return why this state should stop the robot, or None (ignore_stop: leave B to the caller)."""
+    if state.stop_pressed and not ignore_stop:
         return "stop button pressed"
     if not (np.isfinite(state.q).all() and np.isfinite(state.dq).all() and np.isfinite(state.rpy).all()):
         return "non-finite joint or IMU reading"
@@ -740,12 +751,21 @@ class Controller:
         self.env_rows = []  # one per env rebuild while walking: see save_log
         self.probe_height = PROBE_HEIGHT  # the base height the env vector assumes without the estimate
         self.not_walked = None  # why the walk wasn't started, if it wasn't
+        # What B does: None = damp straight away; "soft" (while walking) = raise SoftStop;
+        # "stopping" (during the soft stop) = damp on a second press, once B has been released.
+        self.stop_mode = None
+        self.soft_stopped = False
+        self._stop_released = False
         self.policy_calls = self.target_changes = 0
         self.worst_policy_time = 0.0
         self.calls = []  # (t, robot_state, target, state age, env, gains) per policy call, for go2/diagnose.py
         # Runs every cycle, in every phase, so it has settled by the walk.
         self.estimator = BaseEstimator(calibration=estimator_calibration(calibration))
         self.start_yaw = None
+        # The robot's position in the IMU's world frame, from the estimated velocity, for
+        # the lidar process to move older clouds by (it drifts, but only 0.4 s of it counts).
+        self.position = np.zeros(2)
+        self._position_t = None
 
         self.cmd = unitree_go_msg_dds__LowCmd_()
         self.cmd.head[0], self.cmd.head[1] = 0xFE, 0xEF
@@ -768,12 +788,23 @@ class Controller:
                         f"({self.monitor.delay * 1000:.0f} ms of that waiting to be read)")
         self.worst_state_age = max(self.worst_state_age, age)
         state = read_state(self.monitor.msg)
-        problem = safety_problem(state, check_range)
+        problem = safety_problem(state, check_range, ignore_stop=True)
         if problem:
             raise Fault(problem)
+        if state.stop_pressed:
+            if self.stop_mode == "soft":
+                self.stop_mode, self._stop_released = "stopping", False
+                raise SoftStop()
+            if self.stop_mode != "stopping" or self._stop_released:
+                raise Fault("stop button pressed" + (" again during the soft stop" if self.stop_mode else ""))
+        elif self.stop_mode == "stopping":
+            self._stop_released = True
         if self.lidar is not None:
             now = time.perf_counter()
-            self.lidar.poll(now, state.rpy, self.odom.latest_pose(now) if self.odom else None)
+            if self._position_t is not None:
+                self.position += self.estimator.velocity[:2] * min(now - self._position_t, 0.05)
+            self._position_t = now
+            self.lidar.poll(now, state.rpy, self.odom.latest_pose(now) if self.odom else None, self.position)
         return state
 
     def send(self, q, kp, kd):
@@ -955,9 +986,18 @@ class Controller:
                     self.not_walked = str(reason)
                     print(f"NOT WALKING: {reason}", flush=True)
                 else:
-                    motion()
-                    self.move_to("returning home", HOME, RETURN_HOME_S)
-                    self.hold("settling after walking", HOME, 1.0)
+                    self.stop_mode = "soft"
+                    try:
+                        motion()
+                    except SoftStop:
+                        self.soft_stopped = True
+                        print("B pressed: standing, then lying down (press B again to damp now)", flush=True)
+                        self.move_to("soft stop: standing", HOME, SOFT_STOP_S)
+                        self.hold("soft stop: holding", HOME, SOFT_STOP_HOLD_S)
+                    else:
+                        self.stop_mode = None
+                        self.move_to("returning home", HOME, RETURN_HOME_S)
+                        self.hold("settling after walking", HOME, 1.0)
         self.move_to("lying down", LIE_DOWN, LIE_DOWN_S)
 
     def damp(self):
@@ -1073,7 +1113,8 @@ def connect(args):
         raise Refused("invalid robot state: " + "; ".join(problems))
     lidar = None
     if not args.no_lidar:
-        lidar = LidarProcess(interface, domain, args.layout, args.lidar_mount, args.max_cloud_age, args.lidar_log)
+        lidar = LidarProcess(interface, domain, args.layout, args.lidar_mount, args.max_cloud_age, args.lidar_log,
+                             args.lidar_window)
         if not lidar.wait_ready():
             if args.env_source == "lidar":
                 raise Refused(f"the lidar process didn't start: {lidar.status(time.perf_counter())}")
@@ -1229,7 +1270,7 @@ def prepare_robot(args, monitor, digest, odom=None, lidar=None):
         inputs = "  Inputs:  body velocity and height not given (--no-estimate)\n"
     if not args.trajectory:
         inputs += f"  Env:     {args.env_source} ({args.layout.mode} layout, {args.layout.size} values)"
-        inputs += (f", lidar mount {'from the calibration' if args.lidar_mount else 'not calibrated'}\n"
+        inputs += (f", lidar mount {args.lidar_mount_source}, clouds of the last {args.lidar_window:g} s\n"
                    if not args.no_lidar else ", lidar not read (--no-lidar)\n")
     if lidar is not None:
         status = wait_for_cloud(args, monitor, odom, lidar)
@@ -1337,6 +1378,13 @@ def parse_args():
                         help="with --env-source lidar, stop if the newest usable cloud is older than this many "
                              "seconds (default: %(default)s)")
     parser.add_argument("--no-lidar", action="store_true", help="don't read the lidar at all")
+    parser.add_argument("--lidar-window", type=bounded(0.0, 2.0), default=ACCUMULATE_S, metavar="S",
+                        help="build the lidar's env vector from the clouds of the last S seconds, moved by how "
+                             "far the robot has gone since; 0 = the newest cloud only (default: %(default)s)")
+    parser.add_argument("--lidar-mount", choices=("auto", "calibration", "recovered"), default="auto",
+                        help="auto = the calibration's lidar mount if it has one, otherwise the one fitted to "
+                             "the 2026-11-23 recording; calibration = only the calibration's; recovered = always "
+                             "the 2026-11-23 one (default: %(default)s)")
     parser.add_argument("--sport-mode", default=SPORT_MODE, metavar="NAME",
                         help="the sport mode to switch back to after the run, if the robot was already in "
                              "low-level mode when the run started (default: %(default)s); otherwise it "
@@ -1368,7 +1416,12 @@ def parse_args():
                             probe_bearings_deg=args.probe_bearings, probe_range=args.probe_range,
                             probe_sector_deg=args.probe_sector, probe_rays_per_sector=args.probe_rays)
     cal = None if args.no_calibration else args.calibration_data
-    args.lidar_mount = Mount.from_dict((cal or {}).get("lidar_mount"))
+    calibrated = Mount.from_dict((cal or {}).get("lidar_mount"))
+    if args.lidar_mount == "recovered" or (args.lidar_mount == "auto" and calibrated is None):
+        args.lidar_mount, args.lidar_mount_source = RECOVERED_MOUNT, "fitted to the 2026-11-23 recording"
+    else:
+        args.lidar_mount = calibrated
+        args.lidar_mount_source = "from the calibration" if calibrated else "not calibrated"
     return args
 
 
@@ -1466,6 +1519,8 @@ def main():
         controller.run_sequence(motion, args.seconds, ask_before_walking=bool(args.robot))
         if controller.not_walked:
             outcome, status = f"not walked: {controller.not_walked}", 1
+        elif controller.soft_stopped:
+            outcome, status = "stopped with B (soft stop: stood, then lay down)", 1
     except Fault as fault:
         outcome, status = f"FAULT: {fault}", 1
     except KeyboardInterrupt:
@@ -1508,7 +1563,8 @@ def main():
         if args.leave_sport_off:
             print("Sport mode is off (--leave-sport-off). Switch it on from the app, or restart the robot.")
         else:
-            restore_sport_mode(mode, monitor, finished=status == 0)
+            # A soft stop ends lying down, as a finished run does, so sport mode comes back without asking.
+            restore_sport_mode(mode, monitor, finished=status == 0 or controller.soft_stopped)
     return status
 
 

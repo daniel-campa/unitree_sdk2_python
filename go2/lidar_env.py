@@ -34,7 +34,11 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-CLOUD_TOPICS = ("rt/utlidar/cloud_deskewed", "rt/utlidar/cloud")
+# The raw cloud comes first: it is in the lidar's own frame and keeps publishing with
+# sport mode off. The deskewed cloud is in the odom frame and stops about 1.3 s after
+# sport mode is released (every run on 2026-11-23), so it only helps with sport mode on.
+CLOUD_TOPICS = ("rt/utlidar/cloud", "rt/utlidar/cloud_deskewed")
+LIDAR_FRAME = "utlidar_lidar"
 HEIGHT_MAP_TOPIC = "rt/utlidar/height_map_array"
 LIDAR_STATE_TOPIC = "rt/utlidar/lidar_state"
 WORLD_FRAMES = {"odom", "map", "world"}
@@ -62,6 +66,12 @@ CLEARANCE_RADIUS = 0.10  # m around the base for the overhead ray
 # The robot's own body, legs and lidar housing, in the level base frame. Points inside
 # are dropped. The floor (about -0.27 m) is below it.
 SELF_BOX = ((-0.45, 0.42), (-0.25, 0.25), (-0.15, 0.20))
+
+# The raw cloud has about 1,400 points, 14.7 times a second, so one cloud puts only a
+# couple of points on a box 2-3 m ahead (2026-11-23). The env vector is built from the
+# clouds of the last ACCUMULATE_S seconds, each moved to where the robot is now with the
+# pose (x, y, yaw) it had when it arrived.
+ACCUMULATE_S = 0.4
 
 
 class NoReading(Exception):
@@ -132,6 +142,26 @@ class Mount:
 
     def rotation(self):
         return rotation_rpy(*self.rpy)
+
+
+# Unitree's Go2 model (go2_description.urdf, radar_joint): the lidar 0.289 m ahead of the
+# base and 0.047 m below it, turned 164.9 degrees about y (upside down, tilted forward).
+UNITREE_MOUNT = Mount(LIDAR_FRAME, (0.28945, 0.0, -0.046825), (0.0, 2.8782, 0.0),
+                      {"source": "Unitree's go2_description.urdf radar_joint"})
+
+# Fitted to the floor in the raw clouds recorded by the 2026-11-23 15:22 calibration
+# (60 clouds, 9 mm rms): roll 177.7, pitch 16.0, yaw 180 degrees, which is 1-2 degrees
+# from Unitree's model. Height from sport mode's body height (0.316 m); forward offset
+# from Unitree's model, since the board wasn't in view. run_policy.py uses this when the
+# calibration has no lidar mount.
+RECOVERED_MOUNT = Mount(LIDAR_FRAME, (0.2895, 0.0, 0.0166), (3.1013, 0.2789, math.pi),
+                        {"roll_pitch": True, "height": True, "forward": False, "yaw": False,
+                         "source": "fitted offline to the 2026-11-23 15:22 calibration recording"})
+
+
+def rotation_angle(a, b):
+    """The angle (rad) between two rotation matrices."""
+    return math.acos(max(-1.0, min(1.0, (np.trace(a.T @ b) - 1.0) / 2.0)))
 
 
 def rotation_rpy(roll, pitch, yaw):
@@ -279,12 +309,19 @@ def build_env(points, layout, height):
 
 
 class CloudEnv:
-    """The newest cloud in the level base frame, and the env vector built from it."""
+    """The recent clouds in the level base frame, and the env vector built from them.
 
-    def __init__(self, layout, mount=None):
+    Each usable cloud is kept for window seconds with the robot's pose (x, y, yaw in the
+    IMU's world frame) and base height when it arrived. build() moves them all to where the
+    robot was at the newest cloud and builds one env vector from the lot. window 0 uses
+    only the newest cloud, as before.
+    """
+
+    def __init__(self, layout, mount=None, window=ACCUMULATE_S):
         self.layout = layout
         self.mount = mount
-        self.points = None
+        self.window = window
+        self.points = None  # the newest cloud alone
         self.frame = None
         self.received = None  # time.perf_counter() when the newest usable cloud was taken in
         self.stamp = None  # the cloud's own header stamp
@@ -292,32 +329,71 @@ class CloudEnv:
         self.raw_frame = None
         self.clouds = self.unusable = 0
         self.problem = None  # why the newest cloud couldn't be used, if it couldn't
+        self.history = []  # (received, pose (x, y, yaw), height, level-base points)
 
-    def take(self, msg, now, roll, pitch, odom_pose=None):
-        """Take in a cloud message. Returns True if it could be used."""
+    def take(self, msg, now, roll, pitch, odom_pose=None, pose=None, height=None):
+        """Take in a cloud message. Returns True if it could be used.
+
+        pose is the robot's (x, y, yaw) and height its base height when the cloud arrived;
+        without a pose the robot is taken to have stood still.
+        """
         self.clouds += 1
         try:
             self.raw, self.raw_frame = None, cloud_frame(msg)
             self.raw = decode_points(msg)
-            points = to_level_base(self.raw, self.raw_frame, roll, pitch, self.mount, odom_pose)
+        except NoReading as error:
+            self.unusable += 1
+            self.problem = str(error)
+            return False
+        self.clouds -= 1
+        return self.take_points(self.raw, self.raw_frame, now, roll, pitch, odom_pose, pose, height,
+                                cloud_stamp(msg))
+
+    def take_points(self, raw, frame, now, roll, pitch, odom_pose=None, pose=None, height=None, stamp=None):
+        """take() for points already decoded (go2/lidar_report.py --replay uses this)."""
+        self.clouds += 1
+        self.raw, self.raw_frame = raw, frame
+        try:
+            points = to_level_base(raw, frame, roll, pitch, self.mount, odom_pose)
         except NoReading as error:
             self.unusable += 1
             self.problem = str(error)
             return False
         self.points = points
-        self.frame = self.raw_frame
+        self.frame = frame
         self.received = now
-        self.stamp = cloud_stamp(msg)
+        self.stamp = stamp
         self.problem = None
+        self.history.append((now, tuple(pose) if pose is not None else (0.0, 0.0, 0.0), height, points))
+        self.history = [h for h in self.history if now - h[0] <= self.window + 1e-9]
         return True
 
     def age(self, now):
         return math.inf if self.received is None else now - self.received
 
+    def accumulated(self):
+        """The kept clouds' points, moved into the level base frame of the newest: (points, clouds used)."""
+        if not self.history:
+            return None, 0
+        _, (x0, y0, yaw0), h0, newest = self.history[-1]
+        parts = [newest]
+        for _, (x, y, yaw), h, pts in self.history[:-1]:
+            # level base frame then -> world -> level base frame now (z only shifts with the height)
+            c, s = math.cos(yaw), math.sin(yaw)
+            wx, wy = x + c * pts[:, 0] - s * pts[:, 1], y + s * pts[:, 0] + c * pts[:, 1]
+            c0, s0 = math.cos(yaw0), math.sin(yaw0)
+            dx, dy = wx - x0, wy - y0
+            dz = (h - h0) if (h is not None and h0 is not None) else 0.0
+            parts.append(np.column_stack((c0 * dx + s0 * dy, -s0 * dx + c0 * dy, pts[:, 2] + dz)))
+        return np.concatenate(parts), len(parts)
+
     def build(self, height):
-        if self.points is None:
+        points, used = self.accumulated()
+        if points is None:
             env = self.layout.open_floor(height)
             return env, {"points": 0, "probe_points": np.zeros(self.layout.n_probes, dtype=int),
                          "fallback": np.ones(self.layout.size, dtype=bool), "overhead_points": 0,
-                         "object_hit": False}
-        return build_env(self.points, self.layout, height)
+                         "object_hit": False, "clouds_used": 0}
+        env, info = build_env(points, self.layout, height)
+        info["clouds_used"] = used
+        return env, info

@@ -7,11 +7,16 @@ the kind of delay that fed the policy stale states on 2026-11-19. So a second pr
 does all of it (go2/lidar_env.py) and shares only small arrays with the control loop:
 
   control loop -> worker   the IMU's roll and pitch, the estimated base height, the
-                           odometry pose (for clouds in the odom frame), and whether
-                           the robot is walking (while it is, every cloud's points are kept)
+                           robot's pose (x, y from the estimated velocity, yaw from the
+                           IMU), the odometry pose (for clouds in the odom frame), and
+                           whether the robot is walking (while it is, every cloud's
+                           points are kept)
   worker -> control loop   the newest env vector, when its cloud arrived, which topic it
                            came from, how many points it had and which values fell back
                            to flat floor; and twice a second a status summary
+
+The env vector is built from the clouds of the last `window` seconds (go2/lidar_env.py's
+ACCUMULATE_S, 0.4 s by default), each moved by how far the robot has moved since.
 
 The worker writes a readings file of its own when the run ends, beside the run's log
 (<log>_lidar.npz): every cloud's arrival, topic, frame and point count, the env vector
@@ -31,7 +36,7 @@ import traceback
 
 import numpy as np
 
-from lidar_env import CLOUD_TOPICS, CloudEnv, EnvLayout, Mount, cloud_stamp
+from lidar_env import ACCUMULATE_S, CLOUD_TOPICS, CloudEnv, EnvLayout, Mount, cloud_stamp
 
 POLL_PERIOD = 0.005  # s between looks for a new cloud
 STATUS_PERIOD = 0.5  # s between status messages to the control loop
@@ -42,6 +47,7 @@ START_TIMEOUT = 20.0  # s for the worker to start before the control loop gives 
 # The shared array. The control loop writes the inputs; the worker writes the output
 # block under a sequence number that is odd while it writes (a seqlock).
 IN_ROLL, IN_PITCH, IN_HEIGHT, IN_ODOM, IN_ODOM_OK, IN_SAVING, IN_STOP = 0, 1, 2, 3, 10, 11, 12
+IN_X, IN_Y, IN_YAW = 13, 14, 15  # the robot's pose, for moving older clouds
 OUT = 16
 SEQ, T, TOPIC, POINTS, HIT, BUILD_MS, READY = range(OUT, OUT + 7)
 ENV = OUT + 8
@@ -54,12 +60,13 @@ def shared_size(n_env):
 class LidarProcess:
     """The control loop's side: same calls as before, nothing in them takes more than a few µs."""
 
-    def __init__(self, interface, domain, layout, mount, max_age, readings_path):
+    def __init__(self, interface, domain, layout, mount, max_age, readings_path, window=ACCUMULATE_S):
         import multiprocessing
 
         self.layout = layout
         self.mount = mount
         self.max_age = max_age
+        self.window = window
         self.topics = list(CLOUD_TOPICS)
         self.readings_path = readings_path
         ctx = multiprocessing.get_context("spawn")  # a fresh process: DDS doesn't survive fork
@@ -68,7 +75,7 @@ class LidarProcess:
         self._status_in, status_out = ctx.Pipe(duplex=False)
         self._process = ctx.Process(target=_worker, name="lidar", daemon=True, args=(
             interface, domain, layout.as_dict(), mount.as_dict() if mount else None, max_age,
-            self._shared, status_out, str(readings_path) if readings_path else None, os.getpid()))
+            self._shared, status_out, str(readings_path) if readings_path else None, os.getpid(), window))
         self._process.start()
         status_out.close()
         self.last_status = {}
@@ -92,9 +99,12 @@ class LidarProcess:
             time.sleep(0.05)
         return self.ready()
 
-    def poll(self, now, rpy, odom_pose):
+    def poll(self, now, rpy, odom_pose, position=None):
+        """position: the robot's (x, y) in the IMU's world frame, if known; yaw is rpy[2]."""
         s = self._shared
-        s[IN_ROLL], s[IN_PITCH] = float(rpy[0]), float(rpy[1])
+        s[IN_ROLL], s[IN_PITCH], s[IN_YAW] = float(rpy[0]), float(rpy[1]), float(rpy[2])
+        if position is not None:
+            s[IN_X], s[IN_Y] = float(position[0]), float(position[1])
         if odom_pose is not None:
             s[IN_ODOM:IN_ODOM + 7] = [float(v) for v in odom_pose]
             s[IN_ODOM_OK] = 1.0
@@ -177,11 +187,13 @@ class LidarProcess:
         st = dict(self.stopped or self.last_status)
         st.pop("newest_usable", None)
         return {"topics": self.topics, "layout": self.layout.as_dict(), "max_cloud_age": self.max_age,
+                "window_s": self.window,
                 "mount": self.mount.as_dict() if self.mount else None,
                 "readings_file": str(self.readings_path) if self.readings_path else None, **st}
 
 
-def _worker(interface, domain, layout_dict, mount_dict, max_age, shared, status_out, readings_path, parent_pid):
+def _worker(interface, domain, layout_dict, mount_dict, max_age, shared, status_out, readings_path, parent_pid,
+            window=ACCUMULATE_S):
     """The lidar process."""
     signal.signal(signal.SIGINT, signal.SIG_IGN)  # run_policy.py stops it, after damping
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
@@ -205,7 +217,7 @@ def _worker(interface, domain, layout_dict, mount_dict, max_age, shared, status_
             sub = ChannelSubscriber(topic, PointCloud2_)
             sub.InitPolled()  # newest message only
             subscribers.append(sub)
-        cloud_envs = [CloudEnv(layout, mount) for _ in CLOUD_TOPICS]
+        cloud_envs = [CloudEnv(layout, mount, window) for _ in CLOUD_TOPICS]
         shared[READY] = 1.0
         next_status = 0.0
         while not shared[IN_STOP]:
@@ -219,7 +231,8 @@ def _worker(interface, domain, layout_dict, mount_dict, max_age, shared, status_
                 start = time.perf_counter()
                 odom = tuple(shared[IN_ODOM:IN_ODOM + 7]) if shared[IN_ODOM_OK] else None
                 env = cloud_envs[i]
-                usable = env.take(msg, start, shared[IN_ROLL], shared[IN_PITCH], odom)
+                pose = (shared[IN_X], shared[IN_Y], shared[IN_YAW])
+                usable = env.take(msg, start, shared[IN_ROLL], shared[IN_PITCH], odom, pose, shared[IN_HEIGHT])
                 frame = env.raw_frame or ""
                 if frame not in status["frames"]:
                     status["frames"].append(frame)
@@ -236,11 +249,13 @@ def _worker(interface, domain, layout_dict, mount_dict, max_age, shared, status_
                     next_status = 0.0  # tell the control loop about a topic's first cloud straight away
                 if shared[IN_SAVING] and env.raw is not None and len(saved) < MAX_SAVED_CLOUDS:
                     step = max(1, int(math.ceil(points / SAVED_CLOUD_POINTS)))
-                    saved.append((start, i, shared[IN_ROLL], shared[IN_PITCH], env.raw[::step].astype(np.float32)))
+                    saved.append((start, i, shared[IN_ROLL], shared[IN_PITCH], pose, shared[IN_HEIGHT],
+                                  env.raw[::step].astype(np.float32)))
                 if usable:
                     vector, info = env.build(shared[IN_HEIGHT])
                     done = time.perf_counter()
-                    envs.append((start, i, shared[IN_HEIGHT], vector, info["fallback"], info["points"]))
+                    envs.append((start, i, shared[IN_HEIGHT], vector, info["fallback"], info["points"],
+                                 info["clouds_used"]))
                     # Publish it if it's from the topic the control loop should use: the first
                     # in CLOUD_TOPICS order with a usable cloud within max_age.
                     first = next((j for j, e in enumerate(cloud_envs) if e.age(done) <= max_age), i)
@@ -264,7 +279,7 @@ def _worker(interface, domain, layout_dict, mount_dict, max_age, shared, status_
         status["saved_clouds"] = len(saved)
         if readings_path:
             try:
-                _save(readings_path, layout, mount, max_age, status, arrivals, envs, saved)
+                _save(readings_path, layout, mount, max_age, status, arrivals, envs, saved, window)
                 status["readings_saved"] = True
             except Exception:
                 status["error"] = (status["error"] or "") + traceback.format_exc(limit=3)
@@ -274,26 +289,28 @@ def _worker(interface, domain, layout_dict, mount_dict, max_age, shared, status_
             pass
 
 
-def _save(path, layout, mount, max_age, status, arrivals, envs, saved):
+def _save(path, layout, mount, max_age, status, arrivals, envs, saved, window=ACCUMULATE_S):
     out = {}
     if arrivals:
         t, topic, frame, stamp, points, usable = (np.array(c) for c in zip(*arrivals))
         out.update(arrival_t=t, arrival_topic=topic, arrival_frame=frame, arrival_stamp=stamp,
                    arrival_points=points, arrival_usable=usable)
     if envs:
-        t, topic, height, vector, fallback, points = (np.array(c) for c in zip(*envs))
+        t, topic, height, vector, fallback, points, used = (np.array(c) for c in zip(*envs))
         out.update(env_t=t, env_topic=topic, env_height=height, env=vector, env_fallback=fallback,
-                   env_points=points)
+                   env_points=points, env_clouds_used=used)
     if saved:
-        t, topic, roll, pitch, clouds = zip(*saved)
+        t, topic, roll, pitch, pose, height, clouds = zip(*saved)
         out.update(cloud_t=np.array(t), cloud_topic=np.array(topic), cloud_rpy=np.column_stack((roll, pitch)),
+                   cloud_pose=np.array(pose), cloud_height=np.array(height),
                    cloud_offsets=np.cumsum([0] + [len(c) for c in clouds]), cloud_points=np.concatenate(clouds))
     st = {k: v for k, v in status.items() if k != "newest_usable"}
     meta = {"topics": list(CLOUD_TOPICS), "frames": status["frames"], "layout": layout.as_dict(),
-            "mount": mount.as_dict() if mount else None, "max_cloud_age": max_age, "status": st,
+            "mount": mount.as_dict() if mount else None, "max_cloud_age": max_age, "window_s": window, "status": st,
             "clock": "time.perf_counter(), as the run log's meta clock_start",
             "columns": "arrival_*: every cloud; env*: the env vector from every usable cloud, built with "
                        "env_height; cloud_*: the points of the clouds that arrived while walking, in the cloud's "
                        "own frame (cloud i is cloud_points[cloud_offsets[i]:cloud_offsets[i+1]]), with the "
-                       "IMU's roll and pitch at the time"}
+                       "IMU's roll and pitch, the pose (x, y, yaw) and the base height at the time; "
+                       "env_clouds_used: how many clouds each env vector was built from"}
     np.savez_compressed(path, meta=json.dumps(meta, default=str), **out)

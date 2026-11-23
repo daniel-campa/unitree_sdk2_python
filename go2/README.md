@@ -308,7 +308,7 @@ In simulation the target changes on nearly every policy call, thighs stay within
 
 While it's hanging, also test each way of stopping:
 
-- Press B during a run.
+- Press B during a walk (it should stand, then lie down), and press it twice (it should damp on the second press).
 - Press Ctrl-C during a run.
 - Find out what the motors do when commands stop, by running `pkill -9 -f run_policy.py` in a second terminal during a run. The script can't damp the motors after this, so keep the robot held and clear of people. You'll need to restart the robot afterward.
 
@@ -360,9 +360,11 @@ In `sim_headless.py` (`--flat --dt 0.002`), `joint_trajectories.txt` (157 sample
 
 ### What stops a run
 
+**B while walking is a soft stop.** The legs go to the standing pose in 0.5 s, the robot holds that for 1 s, then it lies down as after a normal walk, and sport mode comes back without asking. Damping mid-stride let the robot fall forward onto the lidar. Press B a second time, after letting go, to damp at once. The run's outcome is `stopped with B (soft stop: ...)`.
+
 These go straight to damping, which lets the robot sink to the ground:
 
-- B on the remote, or Ctrl-C
+- B outside the walk (standing up, waiting, lying down), a second B during a soft stop, or Ctrl-C
 - Tilt above 0.5 rad
 - Joint speed above 25 rad/s (hip, thigh) or 14 rad/s (calf)
 - A motor at 70 °C
