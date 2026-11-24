@@ -41,7 +41,7 @@ from unitree_sdk2py.idl.unitree_go.msg.dds_ import HeightMap_
 BEARINGS_DEG = np.array([30.0, 20.0, 10.0, 0.0, -10.0, -20.0, -30.0])
 SECTOR_DEG = 10.0
 RAYS_PER_SECTOR = 5
-PROBE_RANGE = 4.0  # m; a beam reads 0 beyond this
+PROBE_RANGE = 2.0  # m; a beam reads 0 beyond this
 MAX_DIST = 10.0  # m; the ray meets open floor here
 START_HEIGHT = 0.10  # m above the base
 NOMINAL_BASE_HEIGHT = 0.27  # m above the floor; push_box_turn's target height

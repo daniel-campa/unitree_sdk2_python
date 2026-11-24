@@ -24,7 +24,7 @@ from unitree_sdk2py.idl.unitree_go.msg.dds_ import LowState_, SportModeState_
 
 JOINTS = [f"{leg}_{part}" for leg in ("FR", "FL", "RR", "RL") for part in ("hip", "thigh", "calf")]
 ROBOT_SUBNET = "192.168.123."
-DEFAULT_INTERFACE = "eno1"
+DEFAULT_INTERFACE = "eno2"
 
 
 class TopicMonitor:
