@@ -287,7 +287,7 @@ S-M-ICRL's real-robot loop can run each policy here first, in the window, for yo
 
 **None of this has been tried on a real robot yet.** Do these stages in order, and stop if anything looks or sounds wrong. You need sections 1-4 above done, `$IFACE` set, the remote, and a harness or stand that can hold the robot.
 
-The script asks you to type `yes` and press B on the remote, then lies the robot down and turns sport mode off. It stands up and waits for you to press Enter before walking.
+The script asks you to type `yes` and press B on the remote, then lies the robot down and turns sport mode off. It stands up and waits for you to press Enter before walking. At the end it lies down over 4 s, nose slightly up, and holds that pose while it switches sport mode back on, so the motors never go limp and the head can't settle onto the lidar. It stops sending commands once sport mode reports on. With `--leave-sport-off`, or if sport mode doesn't come back within about 17 s, it fades the rear legs' kp to zero over 2 s and then the front legs' over 3 s, then damps. That still lets the lidar touch the floor lightly.
 
 **1. Read-only.** This publishes nothing, so it can't move the robot:
 
@@ -377,7 +377,7 @@ These go straight to damping, which lets the robot sink to the ground:
 
 The script aims to keep torque within 80% of the limits (`--torque-fraction`). Peaks can go above that. At the old 60% default the thigh reached about 21 N·m in simulation, against a 14 N·m target and a 23.7 N·m limit. On the robot, 60% held the thighs back for about half of each walk, so they often didn't finish a swing before the next policy call and the gait staggered. The 80% default hasn't been tried in simulation or on the robot yet. Expect thigh peaks at the 23.7 N·m limit, where the motor saturates.
 
-Each run saves its data to `go2/logs/<time>.npz`, including `rt/utlidar/robot_odom` when it publishes. After a run that finishes, `run_policy.py` switches sport mode back on, to the mode the robot was in (`--sport-mode` names it if the robot was already in low-level mode). The robot may move when it does. After a stop or a fault it asks first; press Enter to switch it on, or type `n`. `--leave-sport-off` skips this. If it reports that sport mode didn't come back, use the app or restart the robot. This hasn't been tried on the robot yet.
+Each run saves its data to `go2/logs/<time>.npz`, including `rt/utlidar/robot_odom` when it publishes. After a run that finishes, `run_policy.py` switches sport mode back on, to the mode the robot was in (`--sport-mode` names it if the robot was already in low-level mode), while it still holds the lying pose. The robot may move when it does, and for up to 0.5 s both it and sport mode may be commanding the motors. After a stop or a fault it asks first; press Enter to switch it on, or type `n`. `--leave-sport-off` skips this. If it reports that sport mode didn't come back, use the app or restart the robot. This hasn't been tried on the robot yet.
 
 ## Check the odometry
 

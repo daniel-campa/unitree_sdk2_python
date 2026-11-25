@@ -12,7 +12,9 @@ so follow the test order in go2/README.md.
     python go2/run_policy.py --trajectory TRAJ.txt --rate 33    # play back joint angles
 
 The sequence is: stand up, hold, walk for --seconds, return to the home pose, lie
-down, then damp the motors. With --trajectory, the walk is an open-loop playback of
+down, then hold that pose while sport mode switches back on. Without --robot, with
+--leave-sport-off, or if sport mode doesn't come back, it instead fades kp to zero
+(rear legs, then front) and damps the motors. With --trajectory, the walk is an open-loop playback of
 the file's joint angles, interpolated between samples, after a ramp to its first
 sample. A fault, the remote's B button or Ctrl-C goes straight
 to damping. Start the simulator with `python go2/sim_headless.py --flat --dt 0.002`.
@@ -70,8 +72,10 @@ from unitree_sdk2py.utils.crc import CRC
 # Joint order throughout: FR, FL, RR, RL, each hip / thigh / calf. S-M-ICRL and the
 # SDK use the same order.
 HOME = np.array([0.0, 0.9, -1.8] * 4)
-LIE_DOWN = np.array([0.0473455, 1.22187, -2.44375, -0.0473455, 1.22187, -2.44375,
-                     0.0473455, 1.22187, -2.44375, -0.0473455, 1.22187, -2.44375])
+# Nose-up ~0.1 rad: as kp fades the heavier front sinks further and dips the lidar onto
+# the floor. The rear can't fold much more without tripping the calf joint-limit check.
+LIE_DOWN = np.array([0.0473455, 1.15, -2.30, -0.0473455, 1.15, -2.30,
+                     0.0473455, 1.25, -2.50, -0.0473455, 1.25, -2.50])
 HIP_RANGE, CALF_RANGE = (-1.0472, 1.0472), (-2.7227, -0.83776)
 FRONT_THIGH_RANGE, REAR_THIGH_RANGE = (-1.5708, 3.4907), (-0.5236, 4.5379)
 JOINT_RANGES = np.array(
@@ -99,7 +103,15 @@ DT = 0.002  # rt/lowcmd period, as in Unitree's examples
 STAND_UP_S = 3.0
 SETTLE_S = 2.0
 RETURN_HOME_S = 1.0
-LIE_DOWN_S = 3.0
+LIE_DOWN_S = 4.0
+# At the end of the lie-down ramp the legs still carry the body, 0.1-0.2 rad short of
+# LIE_DOWN; cutting kp there drops it onto the lidar.
+LIE_SETTLE_S = 1.0
+# The rear goes limp first while the front still holds the nose up; the front, which
+# carries the head and lidar, then fades slowly.
+REAR_FADE_S = 2.0
+FRONT_FADE_S = 3.0
+REAR_JOINTS = np.arange(12) >= 6
 DAMP_S = 2.0
 DAMP_KD = 4.0
 GO_TIMEOUT_S = 60.0
@@ -128,6 +140,7 @@ RELEASE_ATTEMPTS = 5
 SPORT_MODE = "mcf"  # the mode this Go2 reports while sport mode is on
 RESTORE_ATTEMPTS = 3
 RESTORE_WAIT_S = 4.0
+HANDOVER_TIMEOUT_S = RESTORE_ATTEMPTS * RESTORE_WAIT_S + 5.0  # select_sport_mode's polling, plus its RPCs
 
 LOG_FIELDS = ("t", "stage", "q", "dq", "target", "q_cmd", "tau_est", "temperature", "rpy",
               "gyro", "accel", "foot_force", "power_v", "power_a")
@@ -619,9 +632,9 @@ class Controller:
         return state
 
     def send(self, q, kp, kd):
-        for motor, value in zip(self.cmd.motor_cmd[:12], q):
+        for motor, value, gain in zip(self.cmd.motor_cmd[:12], q, np.broadcast_to(kp, 12)):
             motor.q = float(value)
-            motor.kp = kp
+            motor.kp = float(gain)
             motor.kd = kd
         self.cmd.crc = self.crc.Crc(self.cmd)
         self.publisher.Write(self.cmd)
@@ -633,7 +646,7 @@ class Controller:
             state.foot_force, state.power_v, state.power_a,
         ))
 
-    def run_phase(self, stage, seconds, target_at, check_range=True, stop_when=None):
+    def run_phase(self, stage, seconds, target_at, check_range=True, stop_when=None, kp_at=None):
         """Send target_at(elapsed, state) every cycle until seconds pass or stop_when() is true."""
         print(f"{stage}...", flush=True)
         start = next_tick = time.perf_counter()
@@ -645,8 +658,11 @@ class Controller:
                 return
             state = self.latest_state(check_range)
             target = target_at(elapsed, state)
-            q_cmd = limit_for_torque(target, state.q, state.dq, self.kp, self.kd, self.torque_cap)
-            self.send(q_cmd, self.kp, self.kd)
+            kp = self.kp if kp_at is None else kp_at(elapsed)
+            # limit_for_torque divides by kp; a joint with kp = 0 makes no position torque to limit.
+            q_cmd = np.where(kp > 0, limit_for_torque(target, state.q, state.dq, np.maximum(kp, 1e-9),
+                                                      self.kd, self.torque_cap), target)
+            self.send(q_cmd, kp, self.kd)
             self.record(stage, state, target, q_cmd)
             if elapsed >= next_status:
                 next_status += 1.0
@@ -671,6 +687,13 @@ class Controller:
 
     def hold(self, stage, goal, seconds, stop_when=None):
         self.run_phase(stage, seconds, lambda elapsed, state: goal, stop_when=stop_when)
+
+    def fade_kp(self, stage, goal, seconds, start_kp, fading):
+        """Hold goal while the fading joints' kp falls linearly to zero. Return the kp left."""
+        # No range check: the calves fold onto their stops as the body settles, as under damping.
+        self.run_phase(stage, seconds, lambda elapsed, state: goal, check_range=False,
+                       kp_at=lambda elapsed: np.where(fading, start_kp * (1.0 - elapsed / seconds), start_kp))
+        return np.where(fading, 0.0, start_kp)
 
     def check_ready_to_walk(self):
         state = self.latest_state(check_range=True)
@@ -768,6 +791,32 @@ class Controller:
                     self.move_to("returning home", HOME, RETURN_HOME_S)
                     self.hold("settling after walking", HOME, 1.0)
         self.move_to("lying down", LIE_DOWN, LIE_DOWN_S)
+        self.hold("settling lying down", LIE_DOWN, LIE_SETTLE_S)
+
+    def release(self):
+        """From lying down, let the body settle onto the floor before damping."""
+        kp = self.fade_kp("releasing the rear legs", LIE_DOWN, REAR_FADE_S, np.full(12, self.kp), REAR_JOINTS)
+        self.fade_kp("releasing the front legs", LIE_DOWN, FRONT_FADE_S, kp, ~REAR_JOINTS)
+
+    def hand_to_sport_mode(self, name):
+        """Hold the lying pose while sport mode switches on, so the motors never go limp.
+
+        Even a slow kp fade lets the head settle onto the lidar. Returns the mode sport
+        mode reports, or "" if it didn't come on; then the motors are still ours.
+        """
+        result = {}
+
+        def select():
+            try:
+                result["mode"] = select_sport_mode(name)
+            except Exception:
+                traceback.print_exc()
+
+        worker = threading.Thread(target=select, daemon=True)
+        print(f"Switching sport mode ({name}) back on while holding the lying pose...", flush=True)
+        worker.start()
+        self.hold("handing over to sport mode", LIE_DOWN, HANDOVER_TIMEOUT_S, stop_when=lambda: not worker.is_alive())
+        return "" if worker.is_alive() else result.get("mode", "")
 
     def damp(self):
         """Stream damping. Motor state doesn't matter here, so this can't fault."""
@@ -779,6 +828,10 @@ class Controller:
             self.send(zero, 0.0, DAMP_KD)
             next_tick += DT
             time.sleep(max(0.0, next_tick - time.perf_counter()))
+        try:
+            print(f"Pitch after damping: {read_state(self.monitor.msg).rpy[1]:+.3f} rad (+ is nose down)", flush=True)
+        except Exception:
+            pass
 
     def save_log(self, path, meta, odom):
         if not self.records:
@@ -1241,6 +1294,8 @@ def main():
     controller.probe_height = args.probe_height
     outcome = "finished"
     status = 0
+    sport_mode = original_mode or args.sport_mode  # "" if an earlier run had already released it
+    handed_to = ""
     # A full collection of the growing log stalls the 500 Hz loop for ~25 ms; refcounting frees all but cycles.
     gc.disable()
     try:
@@ -1253,6 +1308,12 @@ def main():
         controller.run_sequence(motion, args.seconds, ask_before_walking=bool(args.robot))
         if controller.not_walked:
             outcome, status = f"not walked: {controller.not_walked}", 1
+        if args.robot and sport_mode and not args.leave_sport_off and status == 0:
+            handed_to = controller.hand_to_sport_mode(sport_mode)
+            if not handed_to:
+                print(f"Sport mode ({sport_mode}) didn't come back; lying the robot down limp.", flush=True)
+        if not handed_to:
+            controller.release()
     except Fault as fault:
         outcome, status = f"FAULT: {fault}", 1
     except KeyboardInterrupt:
@@ -1265,11 +1326,12 @@ def main():
         arm_watchdog(0.0)
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        try:
-            controller.damp()
-        except Exception:
-            traceback.print_exc()
-            outcome, status = f"{outcome}; DAMPING FAILED", 1
+        if not handed_to:  # sport mode now drives the motors
+            try:
+                controller.damp()
+            except Exception:
+                traceback.print_exc()
+                outcome, status = f"{outcome}; DAMPING FAILED", 1
         gc.enable()
 
     if lidar is not None:
@@ -1282,6 +1344,7 @@ def main():
         "fill_height": args.fill_height, "env_source": args.env_source, "env_layout": args.layout.as_dict(),
         "env_hz": args.env_hz,
         "original_mode": original_mode,
+        "handed_to_sport_mode": handed_to,
         # "t" counts from this time.perf_counter() reading, so other programs' times,
         # such as go2/phone_camera.py's, can be matched to the log.
         "clock_start": controller.clock_start,
@@ -1290,12 +1353,13 @@ def main():
     controller.print_summary()
     if saved:
         print(f"Log: {saved}")
-    if args.robot:
-        mode = original_mode or args.sport_mode  # "" if an earlier run had already released it
+    if handed_to:
+        print(f"Sport mode is on ({handed_to}).", flush=True)
+    elif args.robot:
         if args.leave_sport_off:
             print("Sport mode is off (--leave-sport-off). Switch it on from the app, or restart the robot.")
         else:
-            restore_sport_mode(mode, monitor, finished=status == 0)
+            restore_sport_mode(sport_mode, monitor, finished=status == 0)
     return status
 
 
