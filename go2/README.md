@@ -475,7 +475,7 @@ It reads the stream for 5 s and saves a frame as `camera_check.jpg`. Open the fr
 | `opened but sent no frames` | Close any other viewer, such as a browser tab, because some apps serve one viewer at a time. |
 | `... frames/s is below 10` or `a ... s gap between frames` | Lower the app's resolution or quality, or move the phone or the computer closer to the Wi-Fi access point. |
 
-To try a recording, run `python go2/phone_camera.py record <address> test.mp4` and press Ctrl-C to stop it. Next to the video, `test.json` keeps when each frame arrived.
+To try a recording, run `python go2/phone_camera.py record <address> test.mp4` and press Ctrl-C to stop it. Next to the video, `test.json` keeps when each frame arrived. Recordings keep the stream's size up to 1920 wide, and shrink wider ones (`--max-width`). Tags get unreliable once their short side drops to about 14 px. In one iPhone view (a 1920x1080 stream), the robot tag measured 29x20 px shrunk to 960 wide and 59x40 px at 1920, so 1920 finds a still tag from about 1.8 times as far.
 
 ### 5. Use it in the loop
 
@@ -490,7 +490,7 @@ real_robot:
 
 S-M-ICRL's `real_robot.md` explains what the loop does with the pictures.
 
-**Timing:** the recording runs alongside `run_policy.py` on the same computer, at a lower priority. In the simulator on a 12-core computer, the worst loop overrun stayed under 2 ms with and without it. On the robot, compare the `Timing` line of your first runs with the camera against your earlier runs.
+**Timing:** the recording runs alongside `run_policy.py` on the same computer, at a lower priority. In the simulator on a 12-core computer, the worst loop overrun stayed under 2 ms with and without it, recording 960 wide. On an 8-core computer recording 1920 wide, it was 4.4-5.5 ms with it and 5.4-6.1 ms without. Decoding the stream takes most of the recorder's CPU, about one core for a 1080p stream at either width; writing 1920 wide adds about 10% of a core. On the robot, compare the `Timing` line of your first runs with the camera against your earlier runs.
 
 ## Measure the walk with AprilTags
 
@@ -521,7 +521,15 @@ As in [Place the phone](#3-place-the-phone), but higher: 1.5-2 m up, tilted down
 
 ### 3. Calibrate the camera (once per phone, zoom and resolution)
 
-Record the checkerboard with the same settings as the walks (the same app resolution and `--max-width`):
+Record the checkerboard with the same settings as the walks (the same app resolution and `--max-width`). On a computer with a screen, record and calibrate in one go:
+
+```bash
+python go2/tag_tracker.py calibrate go2/logs/calib.mp4 --live <address>
+```
+
+A window shows the recording. Where the board is found, its corners are drawn, and the parts of the picture it hasn't reached yet are tinted red. Move the board until the red is gone, then press q in the window (or Ctrl-C in the terminal): it stops recording and calibrates. The window's counts are a guide, because calibrate looks at 120 frames spread over the recording, so pause for a moment at each place. The window hasn't been opened on a screen yet. With a synthetic video of the board, the recording and calibration worked and recovered the focal length.
+
+Without a screen, record first and calibrate afterwards:
 
 ```bash
 python go2/phone_camera.py record <address> go2/logs/calib.mp4    # Ctrl-C after about a minute
@@ -552,7 +560,7 @@ The frame times are when frames arrived, so they lag the robot by the stream's d
 | Message | What to try |
 |---|---|
 | `the floor tag (ID 1) was never seen` | Check that it's in the picture, that it was printed at 100%, and that its white border wasn't cut off. Move the phone closer. |
-| `the floor tag was over 3 px from where it usually is` | The phone moved, the floor tag was moved, or the robot walked over it. Fix whichever it was, and record again. |
+| `the floor tag was over 3 px from where it usually is` (6 px at 1920 wide) | The phone moved, the floor tag was moved, or the robot walked over it. Fix whichever it was, and record again. |
 | `the robot tag was seen in only ...` | More light, lock focus, bring the phone closer or higher, and check that the tag lies flat. Keep the lane out of the app's watermark: DroidCam's free version writes `using droidcam.app` across the picture, and a tag under it isn't found. |
 | `... is for WxH pictures, but the video is ...` | The calibration was made at a different resolution. Calibrate again with the same settings. |
 | `the video doesn't cover the walk` | Start the recording before `run_policy.py`, on the same computer. |

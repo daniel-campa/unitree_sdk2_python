@@ -9,12 +9,16 @@ third lies flat on the crate's top, and is tracked when it's in the picture. Pri
 them with go2/make_tag_sheets.py.
 
     python go2/tag_tracker.py calibrate CALIB.mp4                 # once per phone and zoom; writes go2/logs/camera.json
+    python go2/tag_tracker.py calibrate CALIB.mp4 --live URL      # records CALIB.mp4 first, with a live window
     python go2/tag_tracker.py track WALK.mp4                      # robot tag relative to the floor tag
     python go2/tag_tracker.py track WALK.mp4 --run go2/logs/RUN.npz   # also report the policy's walk
 
 CALIB.mp4 is a phone_camera.py recording of the printed checkerboard, held flat and
 moved slowly all over the picture at different tilts. Record it with the same
 --max-width as the walk videos, because the calibration belongs to that picture size.
+With --live URL, calibrate records it from the stream itself, as phone_camera.py
+record does, while a window shows the board and the parts of the picture it hasn't
+reached yet. Press q in the window to stop recording and calibrate.
 
 track writes WALK_track.npz (and WALK_track.png) next to the video. Positions are in
 the floor tag's frame: forward along its arrow, left of it, up from the floor, and the
@@ -30,7 +34,11 @@ Exit status: 0 = done, 1 = calibration or tracking failed.
 import argparse
 import json
 import math
+import os
+import signal
 import sys
+import threading
+import time
 from pathlib import Path
 
 import cv2
@@ -51,7 +59,10 @@ CALIB_MIN_SHIFT_PX = 25.0  # a view must move the board this far from every kept
 CALIB_MAX_RMS_PX = 1.0
 CALIB_MIN_COVERAGE = 0.5  # fraction of the picture the board's corners should reach
 
-FLOOR_MOVED_PX = 3.0  # floor tag corners further than this from their median: camera or tag moved
+# Floor tag corners further than this from their median: the camera or the tag moved.
+# Set on 960-wide pictures, so it grows with the picture's width.
+FLOOR_MOVED_PX = 3.0
+FLOOR_MOVED_WIDTH = 960
 FLOOR_MOVED_FRACTION = 0.05
 MIN_ROBOT_DETECTION = 0.5  # of frames, below which tracking fails
 ENDPOINT_S = 0.25  # positions at the ends of the walk are line fits over this long either side
@@ -75,10 +86,12 @@ def read_frames(path, every=1):
     index = 0
     try:
         while True:
-            ok, frame = capture.read()
-            if not ok:
+            if not capture.grab():
                 return
             if index % every == 0:
+                ok, frame = capture.retrieve()
+                if not ok:
+                    return
                 yield index, frame
             index += 1
     finally:
@@ -92,15 +105,178 @@ def frame_count(path):
     return count
 
 
+# Recording the board live ----------------------------------------------------------
+LIVE_WINDOW = "tag_tracker.py calibrate (q stops and calibrates)"
+LIVE_GRID = (6, 4)  # columns and rows; a cell is reached once a board corner has been in it
+LIVE_SEARCH_WIDTH = 960  # the window searches a smaller copy of each frame, to keep up with the stream
+LIVE_SHOW_WIDTH = 1280
+
+
+class BoardWatch:
+    """Searches the newest frame for the board in the background, and remembers where the board has been."""
+
+    def __init__(self, size):
+        self.size = size
+        self._lock = threading.Lock()
+        self._wake = threading.Event()
+        self._closing = False
+        self._frame = None
+        self._corners = None  # in the newest frame searched; None if the board wasn't found there
+        self._cells = np.zeros((LIVE_GRID[1], LIVE_GRID[0]), bool)
+        self._low = self._high = None  # the box around every corner found so far
+        self._places = []  # board centres at least CALIB_MIN_SHIFT_PX apart, as calibrate keeps views
+        self._thread = threading.Thread(target=self._search, daemon=True)
+        self._thread.start()
+
+    def offer(self, frame):
+        with self._lock:
+            self._frame = frame
+        self._wake.set()
+
+    def close(self):
+        self._closing = True
+        self._wake.set()
+        self._thread.join()
+
+    def state(self):
+        """The board's corners or None, the cells reached, the fraction of the picture reached as calibrate
+        measures it, and the number of places."""
+        with self._lock:
+            reach = 0.0 if self._low is None else float(np.prod(self._high - self._low) / np.prod(self.size))
+            return self._corners, self._cells.copy(), reach, len(self._places)
+
+    def _search(self):
+        while True:
+            self._wake.wait()
+            self._wake.clear()
+            if self._closing:
+                return
+            with self._lock:
+                frame, self._frame = self._frame, None
+            if frame is None:
+                continue
+            scale = min(1.0, LIVE_SEARCH_WIDTH / frame.shape[1])
+            small = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+            found, corners = cv2.findChessboardCornersSB(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY), BOARD_INNER,
+                                                         flags=cv2.CALIB_CB_NORMALIZE_IMAGE)
+            corners = corners.reshape(-1, 2) / scale if found else None
+            with self._lock:
+                self._corners = corners
+                if corners is not None:
+                    self._remember(corners)
+
+    def _remember(self, corners):
+        columns = np.clip((corners[:, 0] * LIVE_GRID[0] / self.size[0]).astype(int), 0, LIVE_GRID[0] - 1)
+        rows = np.clip((corners[:, 1] * LIVE_GRID[1] / self.size[1]).astype(int), 0, LIVE_GRID[1] - 1)
+        self._cells[rows, columns] = True
+        low, high = corners.min(axis=0), corners.max(axis=0)
+        self._low = low if self._low is None else np.minimum(self._low, low)
+        self._high = high if self._high is None else np.maximum(self._high, high)
+        centre = corners.mean(axis=0)
+        if all(np.linalg.norm(centre - c) >= CALIB_MIN_SHIFT_PX for c in self._places):
+            self._places.append(centre)
+
+
+def live_view(frame, watch, seconds):
+    """The window's picture: the frame, the board where it was last found, the cells it hasn't reached in red,
+    and a status bar below."""
+    corners, cells, reach, places = watch.state()
+    scale = min(1.0, LIVE_SHOW_WIDTH / frame.shape[1])
+    view = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    h, w = view.shape[:2]
+    red = view.copy()
+    for row, column in zip(*np.nonzero(~cells)):
+        cv2.rectangle(red, (column * w // LIVE_GRID[0], row * h // LIVE_GRID[1]),
+                      ((column + 1) * w // LIVE_GRID[0], (row + 1) * h // LIVE_GRID[1]), (0, 0, 255), -1)
+    view = cv2.addWeighted(red, 0.3, view, 0.7, 0)
+    for column in range(1, LIVE_GRID[0]):
+        cv2.line(view, (column * w // LIVE_GRID[0], 0), (column * w // LIVE_GRID[0], h), (220, 220, 220), 1)
+    for row in range(1, LIVE_GRID[1]):
+        cv2.line(view, (0, row * h // LIVE_GRID[1]), (w, row * h // LIVE_GRID[1]), (220, 220, 220), 1)
+    if corners is not None:
+        cv2.drawChessboardCorners(view, BOARD_INNER, (corners * scale).astype(np.float32).reshape(-1, 1, 2), True)
+    lines = [f"{seconds:.0f} s   board {'found' if corners is not None else 'not found'}   reached {reach:.0%} of the "
+             f"picture (needs {CALIB_MIN_COVERAGE:.0%})   {places} places (needs {CALIB_MIN_VIEWS})",
+             "Move the board slowly into every red cell, corners included, tilted different ways.",
+             "Press q to stop and calibrate."]
+    bar = np.full((14 + 26 * len(lines), w, 3), 40, np.uint8)
+    for i, text in enumerate(lines):
+        cv2.putText(bar, text, (12, 28 + 26 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+    return np.vstack([view, bar])
+
+
+def record_calibration(source, video, max_width=None):
+    """Record source to video as phone_camera.py record does, while a window shows where the board has been.
+
+    Returns once q or Esc is pressed in the window, the window is closed, or Ctrl-C.
+    """
+    from phone_camera import FPS, MAX_WIDTH, CameraError, Stream, fitted, output_size
+
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        raise TrackError("--live needs a screen for its window. Record with phone_camera.py record, then calibrate "
+                         "the recording.")
+    try:
+        stream = Stream(source)
+    except CameraError as error:
+        raise TrackError(str(error)) from None
+    stop = threading.Event()
+    previous = signal.signal(signal.SIGINT, lambda signum, frame: stop.set())
+    writer = watch = None
+    try:
+        stream.wait_first(stop)
+        size = output_size(stream.latest()[0], max_width or MAX_WIDTH)
+        video.parent.mkdir(parents=True, exist_ok=True)
+        writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"mp4v"), FPS, size)
+        if not writer.isOpened():
+            raise TrackError(f"can't write {video}")
+        watch = BoardWatch(size)
+        print(f"Recording {source} to {video}, {size[0]}x{size[1]}. Press q in the window to stop and calibrate.",
+              flush=True)
+        written, start, opened = 0, time.perf_counter(), False
+        while not stop.is_set():
+            frame = fitted(stream.latest()[0], size)
+            writer.write(frame)
+            written += 1
+            watch.offer(frame)
+            view = live_view(frame, watch, time.perf_counter() - start)
+            if written == 1:
+                cv2.namedWindow(LIVE_WINDOW, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(LIVE_WINDOW, view.shape[1], view.shape[0])
+            cv2.imshow(LIVE_WINDOW, view)
+            key = cv2.waitKey(max(1, round((start + written / FPS - time.perf_counter()) * 1000))) & 0xFF
+            visible = cv2.getWindowProperty(LIVE_WINDOW, cv2.WND_PROP_VISIBLE) >= 1
+            # Closed only once it has been seen open, in case this backend never reports it visible.
+            if key in (ord("q"), ord("Q"), 27) or (opened and not visible):
+                break
+            opened = opened or visible
+    except CameraError as error:
+        raise TrackError(str(error)) from None
+    finally:
+        signal.signal(signal.SIGINT, previous)
+        if writer is not None:
+            writer.release()
+        if watch is not None:
+            watch.close()
+        stream.close()
+        cv2.destroyAllWindows()
+        cv2.waitKey(1)
+    print(f"Recorded {time.perf_counter() - start:.0f} s.", flush=True)
+
+
 # Calibration ---------------------------------------------------------------------
 def calibrate(args):
+    if args.live:
+        record_calibration(args.live, args.video, args.max_width)
     total = frame_count(args.video)
     every = max(1, total // CALIB_SAMPLES)
     board = np.zeros((BOARD_INNER[0] * BOARD_INNER[1], 3), np.float32)
     board[:, :2] = np.mgrid[0:BOARD_INNER[0], 0:BOARD_INNER[1]].T.reshape(-1, 2) * args.square_mm / 1000.0
     views, centres, size, looked = [], [], None, 0
+    print(f"Looking for the board in every {every}th of {total} frames ...", flush=True)
     for _, frame in read_frames(args.video, every):
         looked += 1
+        if looked % 20 == 0:
+            print(f"  {looked} of {total // every + 1} frames looked at, board in {len(views)} distinct views", flush=True)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         size = gray.shape[::-1]
         found, corners = cv2.findChessboardCornersSB(gray, BOARD_INNER, flags=cv2.CALIB_CB_NORMALIZE_IMAGE)
@@ -191,19 +367,20 @@ def solve_tag(corners, side, matrix, dist):
     return [(cv2.Rodrigues(r)[0], t.ravel(), float(e)) for r, t, e in zip(rvecs, tvecs, np.ravel(errors))]
 
 
-def floor_pose(floor, matrix, dist, side):
+def floor_pose(floor, matrix, dist, side, width):
     """The floor tag's pose from its median corners, which assumes the camera stayed put."""
     seen = ~np.isnan(floor[:, 0, 0])
     if not seen.any():
         raise TrackError(f"the floor tag (ID {FLOOR_TAG_ID}) was never seen")
     median = np.median(floor[seen], axis=0)
     deviation = np.abs(floor[seen] - median).max(axis=(1, 2))
-    moved = float((deviation > FLOOR_MOVED_PX).mean())
+    moved_px = FLOOR_MOVED_PX * width / FLOOR_MOVED_WIDTH
+    moved = float((deviation > moved_px).mean())
     solutions = solve_tag(median, side, matrix, dist)
     if not solutions:
         raise TrackError("couldn't solve the floor tag's pose")
     rotation, translation, error = solutions[0]
-    info = {"seen_fraction": float(seen.mean()), "moved_fraction": moved,
+    info = {"seen_fraction": float(seen.mean()), "moved_fraction": moved, "moved_px": moved_px,
             "jitter_px": float(np.median(deviation)), "reprojection_px": error,
             "distance_m": float(np.linalg.norm(translation)),
             "view_angle_deg": math.degrees(math.acos(abs(rotation[2, 2])))}
@@ -346,7 +523,7 @@ def track(args):
     robot, floor, crate = corners[args.robot_id], corners[args.floor_id], corners[args.crate_id]
     matrix, dist = load_camera(args.camera, size)
     t, on_run_clock = frame_times(args.video, len(robot), args.latency)
-    floor_rotation, floor_translation, floor_info = floor_pose(floor, matrix, dist, args.floor_size_m)
+    floor_rotation, floor_translation, floor_info = floor_pose(floor, matrix, dist, args.floor_size_m, size[0])
     track = tag_poses(robot, floor_rotation, floor_translation, matrix, dist, args.robot_size_m)
     seen = ~np.isnan(track["forward"])
     crate_track = tag_poses(crate, floor_rotation, floor_translation, matrix, dist, args.crate_size_m)
@@ -358,7 +535,7 @@ def track(args):
           f"off straight-on, corner jitter {floor_info['jitter_px']:.1f} px.")
     if floor_info["moved_fraction"] > FLOOR_MOVED_FRACTION:
         print(f"WARNING: in {floor_info['moved_fraction']:.0%} of the frames the floor tag was over "
-              f"{FLOOR_MOVED_PX:g} px from where it usually is. The camera or the tag moved, or the robot "
+              f"{floor_info['moved_px']:g} px from where it usually is. The camera or the tag moved, or the robot "
               "covered part of it, and positions will be off.")
     if seen.any():
         reproj = np.nanmedian(track["reprojection_px"])
@@ -412,6 +589,9 @@ def main():
     cal.add_argument("--square-mm", type=float, default=BOARD_SQUARE_MM,
                      help="measured size of one printed square (default: %(default)s)")
     cal.add_argument("--out", type=Path, default=DEFAULT_CAMERA, help="(default: go2/logs/camera.json)")
+    cal.add_argument("--live", metavar="URL", help="first record VIDEO from this stream, as phone_camera.py record does, "
+                                                   "with a window showing the board, until q is pressed in it")
+    cal.add_argument("--max-width", type=int, help="with --live: shrink wider frames (default: phone_camera.py record's)")
     trk = commands.add_parser("track", help="track the robot tag in a walk video")
     trk.add_argument("video", type=Path)
     trk.add_argument("--camera", type=Path, default=DEFAULT_CAMERA, help="(default: go2/logs/camera.json)")
@@ -438,4 +618,8 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    status = main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # Skips interpreter shutdown, which aborts the process if --live's stream reader is still inside OpenCV.
+    os._exit(status)

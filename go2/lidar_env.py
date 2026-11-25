@@ -70,10 +70,6 @@ RAY_MIN_POINTS = 2  # points in a stretch needed for a hit, so one stray point i
 FLOOR_TOL, FLOOR_TOL_PER_M = 0.04, 0.01  # m (+ per m) above the floor, by the estimated height, that's still floor
 CLEARANCE_RADIUS = 0.10  # m around the base for the overhead ray
 
-# The robot's own body, legs and lidar housing, in the level base frame. Points inside
-# are dropped. The floor (about -0.27 m) is below it.
-SELF_BOX = ((-0.45, 0.42), (-0.25, 0.25), (-0.15, 0.20))
-
 
 class NoReading(Exception):
     """A cloud can't be turned into the level base frame."""
@@ -222,13 +218,6 @@ def to_level_base(points, frame, roll, pitch, mount=None, odom_pose=None):
     return body @ rotation_rpy(roll, pitch, 0.0).T
 
 
-def drop_self(points):
-    (x0, x1), (y0, y1), (z0, z1) = SELF_BOX
-    inside = ((points[:, 0] > x0) & (points[:, 0] < x1) & (points[:, 1] > y0) & (points[:, 1] < y1)
-              & (points[:, 2] > z0) & (points[:, 2] < z1))
-    return points[~inside]
-
-
 def ray_hit(points, heading, height, max_dist=OPEN_OBSTACLE_DISTANCE):
     """S-M-ICRL's _object_distance_ahead, traced through points: distance along the ray, or None.
 
@@ -266,7 +255,6 @@ def build_env(points, layout, height):
     rays use for their angle and the fallbacks use for open floor.
     Returns (env, info): info["fallback"] marks values with no points behind them.
     """
-    points = drop_self(points)
     open_env = layout.open_floor(height)
     env = open_env.copy()
     fallback = np.zeros(layout.size, dtype=bool)

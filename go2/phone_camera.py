@@ -33,6 +33,8 @@ READ_TIMEOUT_S = 2.0  # a stalled stream is reopened after this
 RETRY_S = 1.0
 MIN_RATE = 10.0  # frames per second; S-M-ICRL picks 30 pictures from a 5 s walk
 MAX_GAP_S = 0.5
+FPS = 15.0
+MAX_WIDTH = 1920
 
 
 class CameraError(Exception):
@@ -232,8 +234,8 @@ def main():
     record_parser = commands.add_parser("record", help="record until Ctrl-C or SIGTERM")
     record_parser.add_argument("source", help="the stream's URL, or the number of a camera on this computer")
     record_parser.add_argument("video", type=Path, help="the .mp4 to write; the frame times go next to it as .json")
-    record_parser.add_argument("--fps", type=positive, default=15.0, help="frames written per second (default: %(default)s)")
-    record_parser.add_argument("--max-width", type=int, default=960, help="shrink wider frames (default: %(default)s)")
+    record_parser.add_argument("--fps", type=positive, default=FPS, help="frames written per second (default: %(default)s)")
+    record_parser.add_argument("--max-width", type=int, default=MAX_WIDTH, help="shrink wider frames (default: %(default)s)")
     record_parser.add_argument("--max-seconds", type=positive, default=900.0,
                                help="stop by itself after this long (default: %(default)s)")
     args = parser.parse_args()
