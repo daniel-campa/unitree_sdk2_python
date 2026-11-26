@@ -108,6 +108,9 @@ def beam_locations(frame, odom, ahead):
         raise NoReading(f"frame {frame!r} needs the robot's pose, but {ODOM_TOPIC} hasn't arrived")
 
     position, q = odom.pose.pose.position, odom.pose.pose.orientation
+    pose = (position.x, position.y, position.z, q.w, q.x, q.y, q.z)
+    if not all(map(math.isfinite, pose)):
+        raise NoReading(f"{ODOM_TOPIC} has a non-finite pose (x, y, z, qw, qx, qy, qz = {pose})")
     yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
     forward = np.array([math.cos(yaw), math.sin(yaw)])
     left = np.array([-math.sin(yaw), math.cos(yaw)])

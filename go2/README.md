@@ -2,7 +2,7 @@
 
 Follow these steps on the Ubuntu computer wired to the robot. They end with a read-only check that sends no commands to the robot.
 
-**Don't run other scripts yet.** Unitree's examples can move the robot as soon as you give them a network interface. `stand_test.py` only works with the simulator, so it can't reach the robot. `run_policy.py` only reaches the robot if you pass `--robot`, and [Run a policy](#run-a-policy) covers when to do that. `check_lidar.py`, `lidar_map.py` and `push_box_map.py` are also read-only, and [Check the lidar](#check-the-lidar) covers them. So is `check_odom.py`, which [Check the odometry](#check-the-odometry) covers. `phone_camera.py` never talks to the robot, and [Film with a phone](#film-with-a-phone) covers it. `tag_tracker.py` and `make_tag_sheets.py` only read videos and write files, and [Measure the walk with AprilTags](#measure-the-walk-with-apriltags) covers them.
+**Don't run other scripts yet.** Unitree's examples can move the robot as soon as you give them a network interface. `stand_test.py` only works with the simulator, so it can't reach the robot. `run_policy.py` only reaches the robot if you pass `--robot`, and [Run a policy](#run-a-policy) covers when to do that. `check_lidar.py`, `lidar_map.py` and `push_box_map.py` are also read-only, and [Check the lidar](#check-the-lidar) covers them. So is `check_odom.py`, which [Check the odometry](#check-the-odometry) covers. `phone_camera.py` never talks to the robot, and [Film with a phone](#film-with-a-phone) covers it. `tag_tracker.py` and `make_tag_sheets.py` only read videos and write files, and [Measure the walk with AprilTags](#measure-the-walk-with-apriltags) covers them. `check_pole.py` reads the pendulum rig's encoder and only subscribes to the robot's state, and [Swing a pendulum up](#swing-a-pendulum-up) covers it.
 
 ## 1. Install
 
@@ -136,6 +136,7 @@ python go2/check_lidar.py "$IFACE" | tee lidar_check.txt
 | `no lidar topics received` | The lidar may be off, or this firmware may use other topic names. Don't try `example/go2/high_level/go2_utlidar_switch.py` as a check, because as written it switches the lidar off. |
 | `frame ... isn't handled` | The script can't place that topic's points relative to the body. This doesn't matter if another source passes. Otherwise, the frame needs adding to the script. |
 | `needs the robot's pose` | That topic's data needs `rt/utlidar/robot_odom`, which isn't arriving. |
+| `has a non-finite pose` | `rt/utlidar/robot_odom` is arriving but its pose is NaN, so the lidar's odometry isn't tracking yet. Its height map is then nearly all unknown too. Check that sport mode is on and the robot is standing. If the pose stays NaN, try power-cycling the robot. |
 | `no source covered all seven beams` | Check `valid %`. A low value on every beam suggests sparse data, and a value near 0 on some beams suggests the lidar can't see them. `--ahead` tries the beams at another distance, to find where coverage starts. |
 
 ### See the height map
@@ -253,7 +254,7 @@ It takes all three of S-M-ICRL's policy forms: a file that ends with `robot.simu
 
 `policies/walk_tmnxt_iter17.py` is an unchanged copy of `iter_17/code.py` from the run `walk_2026-10-27_17-37-32_TMNXT`. The script's default rate and gains (5 Hz, kp 80, kd 4) come from that run. Keep them for this policy, because the rate sets its gait and lower gains make it walk much less far. A policy from another run needs the values from that run's `config.json`.
 
-By default the script feeds the policy fixed flat-floor values instead of real terrain probes, so **the robot can't sense steps or obstacles**. `--env-mode` sets the env vector's layout to the policy's task, and with `--env-source lidar` the vector comes from the lidar instead: see [Give the policy the lidar's env vector](#give-the-policy-the-lidars-env-vector). S-M-ICRL's push_box_turn does both.
+By default the script feeds the policy fixed flat-floor values instead of real terrain probes, so **the robot can't sense steps or obstacles**. `--env-mode` sets the env vector's layout to the policy's task, and with `--env-source lidar` the vector comes from the lidar instead: see [Give the policy the lidar's env vector](#give-the-policy-the-lidars-env-vector). S-M-ICRL's push_box_turn does both. `--pole` adds the pendulum's pole to `robot_state`, for S-M-ICRL's inverted_pendulum tasks: see [Swing a pendulum up](#swing-a-pendulum-up).
 
 It refuses a policy whose output depends on body height or linear velocity (`robot_state[30:34]`), because the robot can't measure them. It checks 200 calls of the policy, so it also catches a policy that only reads them after its start-up phase. `--fill-unmeasured` feeds velocity 0 and a base height of 0.27 m instead of refusing (`--fill-unmeasured 0.25` sets another height). The policy then runs as if its body never moved, so test it that way in simulation first. A policy may keep state between calls. `--check` only loads and checks the policy, without connecting to anything. S-M-ICRL's real-robot loop uses it before each run.
 
@@ -287,7 +288,7 @@ S-M-ICRL's real-robot loop can run each policy here first, in the window, for yo
 
 **None of this has been tried on a real robot yet.** Do these stages in order, and stop if anything looks or sounds wrong. You need sections 1-4 above done, `$IFACE` set, the remote, and a harness or stand that can hold the robot.
 
-The script asks you to type `yes` and press B on the remote, then lies the robot down and turns sport mode off. It stands up and waits for you to press Enter before walking. At the end it lies down over 4 s, nose slightly up, and holds that pose while it switches sport mode back on, so the motors never go limp and the head can't settle onto the lidar. It stops sending commands once sport mode reports on. With `--leave-sport-off`, or if sport mode doesn't come back within about 17 s, it fades the rear legs' kp to zero over 2 s and then the front legs' over 3 s, then damps. That still lets the lidar touch the floor lightly.
+The script asks you to type `yes` and press B on the remote, then lies the robot down and turns sport mode off. It stands up and waits for you to press Enter before walking. At the end it lies down over 4 s, nose slightly up, fades the rear legs' kp to zero over 2 s and then the front legs' over 3 s, then damps. That can let the lidar touch the floor lightly.
 
 **1. Read-only.** This publishes nothing, so it can't move the robot:
 
@@ -372,12 +373,119 @@ These go straight to damping, which lets the robot sink to the ground:
 - No robot state for 0.1 s. An early robot run tripped this while standing, because of how the script read the state, not because of the robot. That's fixed but not yet retested on the robot. If it happens again, keep the log and note `oldest state` in the summary.
 - The control loop stalling for 0.2 s, or the policy failing
 - With `--env-source lidar`, no usable lidar cloud for `--max-cloud-age` (0.5 s). Without a fresh one when you press Enter, it doesn't start walking, and lies down as usual
+- With `--pole`, while walking: no reading from the pole's encoder for `--max-pole-age` (0.1 s), or its board restarting, which loses the encoder's zero
 
 **Nothing protects the robot if the script is killed, the computer fails, or the cable comes out.** Stage 2 shows you what happens then.
 
 The script aims to keep torque within 80% of the limits (`--torque-fraction`). Peaks can go above that. At the old 60% default the thigh reached about 21 N·m in simulation, against a 14 N·m target and a 23.7 N·m limit. On the robot, 60% held the thighs back for about half of each walk, so they often didn't finish a swing before the next policy call and the gait staggered. The 80% default hasn't been tried in simulation or on the robot yet. Expect thigh peaks at the 23.7 N·m limit, where the motor saturates.
 
-Each run saves its data to `go2/logs/<time>.npz`, including `rt/utlidar/robot_odom` when it publishes. After a run that finishes, `run_policy.py` switches sport mode back on, to the mode the robot was in (`--sport-mode` names it if the robot was already in low-level mode), while it still holds the lying pose. The robot may move when it does, and for up to 0.5 s both it and sport mode may be commanding the motors. After a stop or a fault it asks first; press Enter to switch it on, or type `n`. `--leave-sport-off` skips this. If it reports that sport mode didn't come back, use the app or restart the robot. This hasn't been tried on the robot yet.
+Each run saves its data to `go2/logs/<time>.npz`, including `rt/utlidar/robot_odom` when it publishes. After a run that finishes, `run_policy.py` switches sport mode back on, to the mode the robot was in (`--sport-mode` names it if the robot was already in low-level mode). The robot may move when it does. After a stop or a fault it asks first; press Enter to switch it on, or type `n`. `--leave-sport-off` skips this. If it reports that sport mode didn't come back, use the app or restart the robot. This hasn't been tried on the robot yet.
+
+## Swing a pendulum up
+
+S-M-ICRL's `inverted_pendulum_sidelocked_real.yaml` runs its pendulum swing-up on the robot: a pole hangs from a free hinge on a mast on the robot's back, and the policy swings it up and balances it by leaning. The policy reads the pole's angle and rate (`robot_state[37:41]`). An optical encoder on the hinge measures it, an ESP32-S3 counts the encoder's pulses and sends the angle over USB, and `run_policy.py --pole` turns the angle on the hinge into the angle from straight up with the IMU.
+
+**None of this has been built or run on the robot yet.** The rig, the wiring and the firmware are a plan. The software has run in the simulator, and the serial reading against a stand-in on a pseudo-terminal.
+
+### 1. Build the rig
+
+Copy S-M-ICRL's model (`Robots/go2/go2_inverted_pendulum_sidelocked.xml`), so that policies trained in its simulation suit the rig:
+
+| Part | Size |
+|---|---|
+| Mast | Rigid, upright on the middle of the back. The hinge is 0.56 m above the middle of the body, about 0.50 m above the top of the back |
+| Hinge | Turns forward and back only, freely and without stops, on low-friction bearings. The pole hangs 4 cm to the left of the mast, so it swings past it |
+| Pole | 0.40 m from the hinge to the middle of the weight, about 0.1 kg |
+| Weight | 0.5 kg at the end of the pole |
+
+The pole has to clear the robot and the mast all the way round. Hanging, the weight is about 10 cm above the back. The mast and pole add about 0.8 kg to the robot.
+
+**Don't use the encoder's shaft as the hinge.** Its bearings aren't built to carry the pole. Give the pole its own bearings, and join the encoder's 6 mm shaft to the axle with a flexible coupling. Mount the encoder and the ESP32-S3 on the mast, so that no wire crosses the hinge.
+
+S-M-ICRL also has a side-arm rig, with the hinge 0.25 m above the body and 0.20 m to its left, beside the left legs (`sim_headless.py --pendulum sidearm`). Its real-robot config would be a copy of the top rig's with the side-arm scene.
+
+### 2. Wire the encoder and load the firmware
+
+The encoder gives 600 pulses a turn on two channels, A and B. Counting both edges of both gives 2400 counts a turn, 0.15 deg each. The ESP32-S3 counts them with its pulse counter, which misses none.
+
+| Encoder wire | ESP32-S3 |
+|---|---|
+| Red (+) | 5V |
+| Black (-) | GND |
+| White (A) | GPIO 4, and a 2.2-4.7 kΩ resistor from GPIO 4 to 3V3 |
+| Green (B) | GPIO 5, and a 2.2-4.7 kΩ resistor from GPIO 5 to 3V3 |
+
+**Check the outputs before you connect them.** The ESP32-S3's pins take at most 3.3 V. Power the encoder from 5 V with A and B unconnected, and measure A to ground while you turn the shaft slowly. If A only pulls low, or floats, it's an open-collector output, and the resistors to 3V3 make it safe. If it rises to about 5 V by itself, the encoder drives it high: connect A and B through a level shifter instead.
+
+`pole_encoder/pole_encoder.ino` is the firmware. In the Arduino IDE, with the ESP32 boards package 3.0 or later, choose the board "ESP32S3 Dev Module" and set USB CDC On Boot to Enabled. Plug the cable into the board's port labelled USB, where the board appears as `/dev/ttyACM0`. For other pins, change `PIN_A` and `PIN_B`, avoiding GPIO 19 and 20 (the USB port) and 35-37 (the N16R8's memory). **The sketch hasn't been compiled or run on hardware.**
+
+It sends one text line per reading, 500 a second, which is all `run_policy.py` needs from any encoder:
+
+```
+<its clock in microseconds> <hinge angle in radians>
+```
+
+A board on a USB-serial chip needs 500000 baud for that, the default. For another baud rate, add it to the device: `--pole /dev/ttyUSB0@115200`. To open the port without `sudo`, your user has to be in the `dialout` group: `sudo usermod -aG dialout $USER`, then log out and back in.
+
+### 3. Check the encoder and measure its direction
+
+`check_pole.py` is read-only: it subscribes to `rt/lowstate` for the IMU and sends nothing, so leave sport mode on, with the robot standing or lying still.
+
+```bash
+python go2/check_pole.py --robot "$IFACE" --pole /dev/ttyACM0 --calibrate   # once
+python go2/check_pole.py --robot "$IFACE" --pole /dev/ttyACM0
+```
+
+**The encoder doesn't know where it is.** It counts from wherever the shaft was when the board started, and starts again whenever the board restarts. So the zero is taken each time from the pole hanging still: `check_pole.py` takes it before it prints, and `run_policy.py` before each walk. Only the direction is kept. `--calibrate` asks for the pole hanging still, then held still with its tip about 45 deg toward the robot's head, and writes which way the encoder turned to `go2/logs/pole_mount.json`. It stays right until you remount the encoder. `--sign 1` or `--sign -1` writes a direction you already know.
+
+Then it waits for the pole to hang still for 1.5 s, zeroes the readings, and prints the pole twice a second. Hanging should read 180 deg from up. Swing the tip forward and `theta` should fall from 3.14 and stay positive, and backward it should go negative. The check ends with PASS when the encoder sends at least 200 readings a second, with no gap longer than 0.1 s and no restarts.
+
+| It says | What to try |
+|---|---|
+| `can't open the encoder ... Permission denied` | Join the `dialout` group (step 2) |
+| `can't open the encoder ... No such file` | Find the port with `ls /dev/ttyACM* /dev/ttyUSB*` |
+| `no reading in 3 s` | The board isn't sending: check that the cable is in the port labelled USB, and USB CDC On Boot. Some ports restart the board when they open, which takes a moment |
+| `the pole moved while it was read`, `didn't hang still` | Let the pole come to rest, and keep the robot still |
+| `the encoder turned N deg` | In step 2, swing the tip 15-120 deg forward |
+| `restarted N times` | A loose cable or a power dip: each restart loses the zero |
+| `N readings/s, below 200`, or a gap | The board isn't keeping up, or the cable is dropping out |
+
+### 4. Try it in the simulator
+
+`sim_headless.py --pendulum top` puts the rig on the simulated robot, and streams its hinge angle over UDP the way the encoder's board does: 2400 counts a turn, counted from where the pole hung when the simulator started. `--pole udp:9870` reads it, and needs no direction file:
+
+```bash
+# Terminal 1
+python go2/sim_headless.py --flat --dt 0.002 --odom --pendulum top
+
+# Terminal 2
+python go2/check_pole.py
+python go2/run_policy.py POLICY.py --pole udp:9870 --policy-hz 100 --seconds 20
+```
+
+The simulated hinge is frictionless, as in S-M-ICRL, so the simulator steadies the pole, as your hand would, until `run_policy.py` starts walking, and again afterwards. Terminal 1 prints `pole: released` and `pole: steadied`, and the pole's angle from up every second. Terminal 2 zeroes the encoder at the end of settling, as on the robot.
+
+The simulator stays at real time with the rig. A test policy that leans back and forth in time with the swing got the pole within 85 deg of upright here, and within 97 deg in S-M-ICRL's simulation. The zero came within 0.12 deg of hanging, and with 500 readings a second the rate in `robot_state[38]` matched the change in angle to about 10%, lagging it by about 0.01 s.
+
+S-M-ICRL's preview starts the simulator with `--pendulum` and runs `run_policy.py --pole udp:9870`.
+
+### 5. Run it on the robot
+
+Follow the stages in [Test on the robot](#test-on-the-robot), with `--pole` and the policy's rate, 100 Hz in S-M-ICRL's pendulum configs:
+
+```bash
+python go2/run_policy.py POLICY.py --robot "$IFACE" --pole /dev/ttyACM0 --policy-hz 100 --dry-run --seconds 30
+python go2/run_policy.py POLICY.py --robot "$IFACE" --pole /dev/ttyACM0 --policy-hz 100 --seconds 0
+python go2/run_policy.py POLICY.py --robot "$IFACE" --pole /dev/ttyACM0 --policy-hz 100 --seconds 5
+```
+
+- **Before the run:** the summary you confirm shows the encoder's reading. With no reading in 3 s, it refuses. `--dry-run` first waits up to 10 s for the pole to hang still, to zero it.
+- **The start:** once it stands, steady the pole and let go. While it waits, the status line shows how far the pole moved in the last 1.5 s. Press Enter once that's under 3 deg: it takes the encoder's zero from the hanging pole and starts. Pressed sooner, it says why and waits for Enter again.
+- **During the run:** the status line shows the pole's angle from up. No encoder reading for 0.1 s, or the board restarting, stops the run.
+- **Keep everyone 1 m clear.** The weight swings through a circle about 0.8 m across, up to about 1.2 m above the floor. It keeps swinging after the run stops, and while the robot lies down.
+- **The summary** gives the encoder's readings per second and longest gap while walking, and how close the pole came to upright.
+
+The log has the pole on every row: `pole_raw` and `pole_hinge` (the encoder's count as an angle, and the angle on the hinge), `pole_theta` and `pole_rate` (what the policy gets), `pole_up` (the pole's upward component, from which S-M-ICRL scores the run) and `pole_age`. The angles are NaN until the zero is taken, and the log's `meta` has the zero and how far the pole moved while it was taken. `pole_readings` has every reading the encoder sent.
 
 ## Check the odometry
 

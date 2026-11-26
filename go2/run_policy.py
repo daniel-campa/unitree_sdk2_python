@@ -12,9 +12,8 @@ so follow the test order in go2/README.md.
     python go2/run_policy.py --trajectory TRAJ.txt --rate 33    # play back joint angles
 
 The sequence is: stand up, hold, walk for --seconds, return to the home pose, lie
-down, then hold that pose while sport mode switches back on. Without --robot, with
---leave-sport-off, or if sport mode doesn't come back, it instead fades kp to zero
-(rear legs, then front) and damps the motors. With --trajectory, the walk is an open-loop playback of
+down, fade kp to zero (rear legs, then front), damp the motors, then switch sport
+mode back on. With --trajectory, the walk is an open-loop playback of
 the file's joint angles, interpolated between samples, after a ramp to its first
 sample. A fault, the remote's B button or Ctrl-C goes straight
 to damping. Start the simulator with `python go2/sim_headless.py --flat --dt 0.002`.
@@ -24,6 +23,13 @@ gives. With --env-source lidar it's rebuilt instead from the lidar's point cloud
 go2/lidar_env.py, in a process of its own (go2/lidar_worker.py), using the lidar mount
 that go2/lidar_calibrate.py measured. A walk then needs a fresh usable cloud: without
 one it doesn't start, and if the clouds stop for --max-cloud-age it faults.
+
+With --pole, robot_state gets S-M-ICRL's pole state for its side-locked inverted_pendulum
+tasks (41 values instead of 37), from the rig's hinge encoder (go2/pole_encoder.py) and the
+IMU. The walk starts only once the pole has hung still for 1.5 s, which also gives the
+encoder its zero, and stops if the encoder goes quiet for --max-pole-age or restarts. In
+the simulator (--pole udp:9870 against sim_headless.py --pendulum) the pole is steadied
+until the walk starts, as the operator's hand does on the robot.
 
 The log also keeps rt/utlidar/robot_odom, the robot's position estimate, when it
 publishes. Nothing here acts on it; S-M-ICRL scores walking with it.
@@ -42,6 +48,7 @@ import builtins
 import gc
 import hashlib
 import json
+import math
 import select
 import signal
 import sys
@@ -57,6 +64,8 @@ import numpy as np
 from check_connection import DEFAULT_INTERFACE, JOINTS, check_interface, state_problems
 from lidar_env import CLOUD_WINDOW_S, MOUNT_FILE, EnvLayout, load_mount
 from lidar_worker import LidarProcess
+from pole_encoder import (HANGING_STILL_DEG, MAX_POLE_AGE, ZERO_WINDOW_S, HangingWindow, PoleReader, default_mount,
+                          pole_state, wait_still)
 from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient
 from unitree_sdk2py.core.channel import (
     ChannelFactoryInitialize,
@@ -121,11 +130,17 @@ MAX_WALK_S = 60.0
 # 11 rad/s (thigh) and 8 rad/s (calf).
 MAX_TILT = 0.5  # rad
 MAX_SPEED = np.array([25.0, 25.0, 14.0] * 4)  # rad/s, below Unitree's 30.1 and 15.7
-MAX_TEMPERATURE = 85  # °C
+MAX_TEMPERATURE = 90  # °C
 JOINT_LIMIT_MARGIN = 0.05  # rad
 MAX_STATE_AGE = 0.1  # s
 # The policy holds each target for 200 ms anyway, so a shorter stall is harmless.
 MAX_LOOP_STALL = 0.2  # s
+
+POLE_WAIT_S = 3.0  # for the encoder's first reading; a board may restart when its port opens
+POLE_STILL_WAIT_S = 10.0  # for the pole to hang still before a dry run
+POLE_FIELDS = ("pole_raw", "pole_hinge", "pole_hinge_rate", "pole_age", "pole_theta", "pole_rate", "pole_up")
+# Pole states check_policy tries: hanging at rest, and near the top, swinging forward.
+POLE_CHECK_STATES = ((np.pi, 0.0), (0.3, 1.0))
 
 # Limits for starting to walk.
 MAX_STAND_ERROR = 0.2  # rad; kp = 80 sags the rear hips by about 0.12 rad
@@ -140,7 +155,6 @@ RELEASE_ATTEMPTS = 5
 SPORT_MODE = "mcf"  # the mode this Go2 reports while sport mode is on
 RESTORE_ATTEMPTS = 3
 RESTORE_WAIT_S = 4.0
-HANDOVER_TIMEOUT_S = RESTORE_ATTEMPTS * RESTORE_WAIT_S + 5.0  # select_sport_mode's polling, plus its RPCs
 
 LOG_FIELDS = ("t", "stage", "q", "dq", "target", "q_cmd", "tau_est", "temperature", "rpy",
               "gyro", "accel", "foot_force", "power_v", "power_a")
@@ -238,8 +252,8 @@ def unmeasured_values(fill_height):
     return [0.0, 0.0, 0.0, fill_height]
 
 
-def build_robot_state(state, start_yaw, fill_height=None):
-    """Build S-M-ICRL's 37-element robot_state from what the robot can measure.
+def build_robot_state(state, start_yaw, fill_height=None, pole=None):
+    """Build S-M-ICRL's 37-element robot_state from what the robot can measure, plus pole_state()'s 4 with pole.
 
     Linear velocity and height need sport mode or an estimator. They are NaN, and
     check_policy refuses policies that use them, unless fill_height is given: then
@@ -252,7 +266,7 @@ def build_robot_state(state, start_yaw, fill_height=None):
     up = [2.0 * (x * z - w * y), 2.0 * (y * z + w * x), 1.0 - 2.0 * (x * x + y * y)]
     return np.concatenate([
         state.q, state.dq, [roll, pitch, yaw_deviation], state.gyro,
-        unmeasured_values(fill_height), up,
+        unmeasured_values(fill_height), up, [] if pole is None else pole,
     ])
 
 
@@ -424,18 +438,21 @@ def _check_outputs(path, robot_state, env):
     return np.array([policy_target(policy, robot_state, env) for _ in range(CHECK_CALLS)])
 
 
-def check_policy(path, env, fill_height=None):
+def check_policy(path, env, fill_height=None, pole=False):
     """Refuse a policy that fails, or that depends on state the robot can't provide.
 
     Each probe runs a fresh copy of the policy for CHECK_CALLS calls, so a policy
     that keeps its own state, or only reads some inputs after a few calls, is
     compared over all of them. With fill_height, the policy gets constants for that
-    state instead, so it may use it, but it must still be repeatable.
+    state instead, so it may use it, but it must still be repeatable. With pole,
+    robot_state has the pole's 4 values too, and each probe is tried with the pole
+    in each of POLE_CHECK_STATES.
     """
-    for thigh in (0.7, 0.9, 1.1):
+    poles = [[theta, rate, np.cos(theta), np.sin(theta)] for theta, rate in POLE_CHECK_STATES] if pole else [[]]
+    for thigh, pole_values in ((t, p) for t in (0.7, 0.9, 1.1) for p in poles):
         q = HOME.copy()
         q[1::3] = thigh
-        robot_state = np.concatenate([q, np.zeros(18), unmeasured_values(fill_height), [0.0, 0.0, 1.0]])
+        robot_state = np.concatenate([q, np.zeros(18), unmeasured_values(fill_height), [0.0, 0.0, 1.0], pole_values])
         try:
             reference = _check_outputs(path, robot_state, env)
         except Fault as fault:
@@ -443,6 +460,9 @@ def check_policy(path, env, fill_height=None):
                 raise Fault("it returned non-finite values when body height and linear velocity "
                             "(robot_state[30:34]) were NaN, so it reads them, and the robot can't "
                             "provide them (--fill-unmeasured feeds constants instead)") from fault
+            if not pole and "out of bounds" in str(fault):
+                raise Fault(f"{fault}: without --pole, robot_state has {robot_state.size} values, and an "
+                            f"inverted_pendulum policy reads the pole's 4 after them") from fault
             raise
         if fill_height is not None:
             if not np.array_equal(_check_outputs(path, robot_state, env), reference):
@@ -459,11 +479,11 @@ def check_policy(path, env, fill_height=None):
                 )
 
 
-def prepare_policy(path, env, fill_height=None):
+def prepare_policy(path, env, fill_height=None, pole=False):
     """Return a checked policy and the file's hash. A stalling policy trips the watchdog."""
-    arm_watchdog(5.0)
+    arm_watchdog(10.0 if pole else 5.0)  # with the pole, check_policy runs twice the probes
     try:
-        check_policy(path, env, fill_height)
+        check_policy(path, env, fill_height, pole)
         policy = load_policy(path)  # a fresh copy, unaffected by the checks above
     except Exception as error:
         raise Refused(f"can't use policy {path}: {error}") from error
@@ -605,6 +625,15 @@ class Controller:
         self.probe_height = PROBE_HEIGHT  # the base height the env vector assumes
         self.env_rows = []  # one per env rebuild while walking: see save_log
         self.not_walked = None  # why the walk wasn't started, if it wasn't
+        self.pole = None  # a PoleReader, with --pole
+        self.pole_mount = None
+        self.max_pole_age = MAX_POLE_AGE
+        self.pole_window = HangingWindow()
+        self.pole_window_restarts = 0
+        self.pole_zero = None  # (zero, spread, encoder restarts then), taken as the walk starts
+        self.pole_now = None  # this cycle's POLE_FIELDS, or None before the encoder's first reading
+        self.pole_rows = []  # POLE_FIELDS for every record, NaN where there was no reading
+        self.walk_started = None  # time.perf_counter() when the walk began
 
         self.cmd = unitree_go_msg_dds__LowCmd_()
         self.cmd.head[0], self.cmd.head[1] = 0xFE, 0xEF
@@ -629,7 +658,53 @@ class Controller:
         if self.lidar is not None:
             now = time.perf_counter()
             self.lidar.poll(now, state.rpy, self.odom.latest_pose(now) if self.odom is not None else None)
+        if self.pole is not None:
+            self.track_pole(state)
         return state
+
+    def track_pole(self, state):
+        self.pole_now = read_pole(self.pole, self.pole_mount, self.pole_zero[0] if self.pole_zero else None, state)
+        if self.pole.restarts != self.pole_window_restarts:
+            self.pole_window_restarts = self.pole.restarts
+            self.pole_window.clear()  # the readings before a restart count from another zero
+        if self.pole_now is not None and self.pole_now[3] <= self.max_pole_age:
+            self.pole_window.add(time.perf_counter(), self.pole_now[0], state.quaternion)
+
+    def pole_for_policy(self):
+        """This cycle's pole_state() for robot_state. A stale or missing reading faults."""
+        if self.pole_now is None or self.pole_zero is None:
+            raise Fault(f"no zeroed reading from the pole's encoder ({self.pole.describe()})")
+        if self.pole.restarts != self.pole_zero[2]:
+            raise Fault("the pole's encoder restarted, so its zero is lost")
+        _, _, _, age, theta, rate, _ = self.pole_now
+        if age > self.max_pole_age:
+            raise Fault(f"the pole's encoder sent nothing for {age * 1000:.0f} ms")
+        return theta, rate, math.cos(theta), math.sin(theta)
+
+    def zero_pole(self):
+        """Take the encoder's zero from the pole hanging still. Returns why it can't, or None once it has."""
+        if self.pole is None:
+            return None
+        if self.pole_now is None or self.pole_now[3] > self.max_pole_age:
+            return f"no fresh reading from the pole's encoder ({self.pole.describe()})"
+        found = self.pole_window.zero(self.pole_mount.sign)
+        if found is None:
+            return f"the pole has to hang still for {ZERO_WINDOW_S:g} s"
+        zero, spread = found
+        if np.degrees(spread) > HANGING_STILL_DEG:
+            return (f"the pole isn't hanging still: it moved {np.degrees(spread):.1f} deg in the last "
+                    f"{ZERO_WINDOW_S:g} s, more than {HANGING_STILL_DEG:g}")
+        self.pole_zero = (zero, spread, self.pole.restarts)
+        return None
+
+    def pole_status(self):
+        """The pole for the status line: its angle once zeroed, how still it is before."""
+        if self.pole is None:
+            return ""
+        if self.pole_zero is not None and self.pole_now is not None:
+            return f"  pole={np.degrees(np.arccos(self.pole_now[6])):3.0f}° from up"
+        found = self.pole_window.zero(self.pole_mount.sign)
+        return f"  pole moved {np.degrees(found[1]):.1f}° in {ZERO_WINDOW_S:g} s" if found else ""
 
     def send(self, q, kp, kd):
         for motor, value, gain in zip(self.cmd.motor_cmd[:12], q, np.broadcast_to(kp, 12)):
@@ -645,6 +720,8 @@ class Controller:
             state.tau_est, state.temperature, state.rpy, state.gyro, state.accel,
             state.foot_force, state.power_v, state.power_a,
         ))
+        if self.pole is not None:
+            self.pole_rows.append(self.pole_now if self.pole_now is not None else (np.nan,) * len(POLE_FIELDS))
 
     def run_phase(self, stage, seconds, target_at, check_range=True, stop_when=None, kp_at=None):
         """Send target_at(elapsed, state) every cycle until seconds pass or stop_when() is true."""
@@ -667,7 +744,8 @@ class Controller:
             if elapsed >= next_status:
                 next_status += 1.0
                 print(f"  {stage} t={elapsed:4.1f} s  roll={state.rpy[0]:+.2f}  pitch={state.rpy[1]:+.2f}  "
-                      f"hottest={state.temperature.max()} °C  current={state.power_a:.1f} A", flush=True)
+                      f"hottest={state.temperature.max()} °C  current={state.power_a:.1f} A{self.pole_status()}",
+                      flush=True)
             next_tick += DT
             remaining = next_tick - time.perf_counter()
             if remaining > 0:
@@ -706,17 +784,23 @@ class Controller:
 
     def wait_for_go(self):
         termios.tcflush(sys.stdin, termios.TCIFLUSH)  # an earlier Enter must not start the walk
-        print(f"Standing. Press Enter to walk (Ctrl-C or B stops). "
+        steady = " Steady the pole, let go of it, and once it hangs still" if self.pole is not None else ""
+        print(f"Standing.{steady} Press Enter to walk (Ctrl-C or B stops). "
               f"It lies down after {GO_TIMEOUT_S:.0f} s.", flush=True)
 
         def entered():
             return bool(select.select([sys.stdin], [], [], 0.0)[0])
 
-        self.hold("waiting", HOME, GO_TIMEOUT_S, stop_when=entered)
-        if not entered():
-            return False
-        sys.stdin.readline()
-        return True
+        deadline = time.perf_counter() + GO_TIMEOUT_S
+        while True:
+            self.hold("waiting", HOME, max(0.0, deadline - time.perf_counter()), stop_when=entered)
+            if not entered():
+                return False
+            sys.stdin.readline()
+            problem = self.zero_pole()
+            if problem is None:
+                return True
+            print(f"Not walking yet: {problem}. Press Enter once it hangs still.", flush=True)
 
     def walk(self, policy, env, policy_hz, seconds, fill_height=None, env_hz=ENV_HZ):
         """Run the policy as S-M-ICRL's simulate_rollout does.
@@ -731,6 +815,9 @@ class Controller:
         live_env = env.copy()
         if self.lidar is not None:
             self.lidar.saving = True
+        if self.pole is not None:
+            self.pole.release()
+        self.walk_started = time.perf_counter()
 
         def target_at(elapsed, state):
             nonlocal gains, target, next_call, next_env, live_env
@@ -744,7 +831,8 @@ class Controller:
                                       info["fallback"], bool(info["object_hit"])))
                 next_env = int(elapsed * env_hz) + 1
             if gains is None or elapsed >= next_call / policy_hz:
-                robot_state = build_robot_state(state, start_yaw, fill_height)
+                pole = self.pole_for_policy() if self.pole is not None else None
+                robot_state = build_robot_state(state, start_yaw, fill_height, pole)
                 call_start = time.perf_counter()
                 gains = policy_gains(policy, robot_state, live_env.size)
                 self.worst_policy_time = max(self.worst_policy_time, time.perf_counter() - call_start)
@@ -761,6 +849,8 @@ class Controller:
         finally:
             if self.lidar is not None:
                 self.lidar.saving = False
+            if self.pole is not None:
+                self.pole.steady()
 
     def check_lidar_ready(self):
         """With the lidar, don't start walking without a usable, fresh cloud."""
@@ -769,6 +859,13 @@ class Controller:
         now = time.perf_counter()
         if self.lidar.current(now) is None:
             raise NotWalking(f"--env-source lidar, but there's no usable lidar cloud: {self.lidar.status(now)}")
+
+    def check_pole_ready(self):
+        """With the pole, don't start the swing-up unless it hangs still, and zeroed from it."""
+        if self.pole is not None and self.pole_zero is None:
+            problem = self.zero_pole()
+            if problem is not None:
+                raise NotWalking(problem)
 
     def play(self, rows, rate, seconds):
         self.move_to("moving to the first sample", rows[0], RETURN_HOME_S)
@@ -783,6 +880,7 @@ class Controller:
             if not ask_before_walking or self.wait_for_go():
                 try:
                     self.check_lidar_ready()
+                    self.check_pole_ready()
                 except NotWalking as reason:
                     self.not_walked = str(reason)
                     print(f"NOT WALKING: {reason}", flush=True)
@@ -797,26 +895,6 @@ class Controller:
         """From lying down, let the body settle onto the floor before damping."""
         kp = self.fade_kp("releasing the rear legs", LIE_DOWN, REAR_FADE_S, np.full(12, self.kp), REAR_JOINTS)
         self.fade_kp("releasing the front legs", LIE_DOWN, FRONT_FADE_S, kp, ~REAR_JOINTS)
-
-    def hand_to_sport_mode(self, name):
-        """Hold the lying pose while sport mode switches on, so the motors never go limp.
-
-        Even a slow kp fade lets the head settle onto the lidar. Returns the mode sport
-        mode reports, or "" if it didn't come on; then the motors are still ours.
-        """
-        result = {}
-
-        def select():
-            try:
-                result["mode"] = select_sport_mode(name)
-            except Exception:
-                traceback.print_exc()
-
-        worker = threading.Thread(target=select, daemon=True)
-        print(f"Switching sport mode ({name}) back on while holding the lying pose...", flush=True)
-        worker.start()
-        self.hold("handing over to sport mode", LIE_DOWN, HANDOVER_TIMEOUT_S, stop_when=lambda: not worker.is_alive())
-        return "" if worker.is_alive() else result.get("mode", "")
 
     def damp(self):
         """Stream damping. Motor state doesn't matter here, so this can't fault."""
@@ -845,6 +923,17 @@ class Controller:
             columns.update({name: np.array(c) for name, c in zip(names, zip(*self.env_rows))})
         if self.lidar is not None:
             meta = dict(meta, lidar=self.lidar.meta())  # the clouds are in its readings file
+        if self.pole is not None:
+            # pole_* line up with t; pole_readings is every encoder reading: arrival on t's clock,
+            # the encoder's own clock, and its raw angle.
+            columns.update({name: np.array(c, dtype=float) for name, c in zip(POLE_FIELDS, zip(*self.pole_rows))})
+            readings = np.array(self.pole.readings, dtype=float).reshape(-1, 3)
+            readings[:, 0] -= self.clock_start
+            columns["pole_readings"] = readings
+            zero, spread, _ = self.pole_zero or (None, None, None)
+            meta = dict(meta, pole={"source": self.pole.source, "mount": self.pole_mount.as_dict(), "zero": zero,
+                                    "zero_spread": spread, "bad_lines": self.pole.bad_lines,
+                                    "restarts": self.pole.restarts})
         np.savez_compressed(path, meta=json.dumps(meta, default=str), **columns, **odom.columns(self.clock_start))
         return path
 
@@ -858,6 +947,19 @@ class Controller:
                   f"thigh {tau[:, 1::3].max():.1f}, calf {tau[:, 2::3].max():.1f} N·m")
         print(f"Timing: worst loop overrun {self.worst_overrun * 1000:.1f} ms, "
               f"oldest state {self.worst_state_age * 1000:.1f} ms")
+        if self.pole is not None:
+            walking = np.array([record[1] == "walking" for record in self.records], dtype=bool)
+            rows = np.array(self.pole_rows, dtype=float).reshape(-1, len(POLE_FIELDS))
+            if not walking.any():
+                walking[:] = True
+            since = self.walk_started if self.walk_started is not None else self.clock_start
+            ages, ups = rows[walking, 3], rows[walking, 6]
+            print(f"Pole encoder {'while walking' if self.walk_started is not None else 'while commanding'}: "
+                  f"{self.pole.rate_hz(since):.0f} readings/s, longest gap {self.pole.worst_gap(since) * 1000:.1f} ms, "
+                  f"oldest reading {np.nanmax(ages) * 1000 if np.isfinite(ages).any() else math.nan:.1f} ms; "
+                  f"{self.pole.bad_lines} unreadable lines, {self.pole.restarts} restarts")
+            if self.walk_started is not None and np.isfinite(ups).any():
+                print(f"Pole while walking: closest to upright {np.degrees(np.arccos(np.nanmax(ups))):.0f} deg from up")
         if self.lidar is None:
             return
         m = self.lidar.meta()
@@ -878,6 +980,23 @@ class Controller:
             names = [f"probe{i}" for i in range(self.lidar.layout.n_probes)] + ["clearance", "object_dist", "bias"]
             print(f"Lidar env while walking, {len(given)} rebuilds: mean "
                   + ", ".join(f"{n} {v:+.3f}" for n, v in zip(names, given.mean(axis=0))))
+
+
+def read_pole(reader, mount, zero, state):
+    """POLE_FIELDS for the newest encoder reading and this state, or None before the first reading.
+
+    Without a zero, the angles are NaN.
+    """
+    reader.poll()
+    reading = reader.latest()
+    if reading is None:
+        return None
+    raw, raw_rate, age = reading
+    if zero is None:
+        return raw, np.nan, mount.sign * raw_rate, age, np.nan, np.nan, np.nan
+    hinge = mount.hinge(raw, zero)
+    theta, rate, _, _, up = pole_state(hinge, mount.sign * raw_rate, state.quaternion, state.gyro)
+    return raw, hinge, mount.sign * raw_rate, age, theta, rate, up
 
 
 def clouds_since(readings_path, since):
@@ -943,6 +1062,18 @@ def connect(args):
     problems = state_problems(monitor.msg)
     if problems:
         raise Refused("invalid robot state: " + "; ".join(problems))
+    pole = None
+    if args.pole:
+        try:
+            pole = PoleReader(args.pole)
+        except (OSError, ValueError) as error:
+            raise Refused(f"can't open the pole's encoder {args.pole}: {error}") from error
+        pole.steady()
+        if not pole.wait(POLE_WAIT_S):
+            pole.close()
+            where = ("Is go2/sim_headless.py running with --pendulum?" if pole.simulated
+                     else "Is the encoder's microcontroller plugged in, and sending?")
+            raise Refused(f"no reading from the pole's encoder {args.pole} in {POLE_WAIT_S:g} s. {where}")
     lidar = None
     if args.env_source == "lidar":
         lidar = LidarProcess(interface, domain, args.layout, args.lidar_mount, args.max_cloud_age, args.lidar_log,
@@ -951,7 +1082,19 @@ def connect(args):
             status = lidar.status(time.perf_counter())
             lidar.stop(timeout=1.0)
             raise Refused(f"the lidar process didn't start: {status}")
-    return monitor, subscriber, OdomRecorder(), lidar
+    return monitor, subscriber, OdomRecorder(), lidar, pole
+
+
+def describe_pole(pole, mount, zero, state):
+    """How the pole reads now, for the operator."""
+    reading = read_pole(pole, mount, zero, state)
+    if reading is None:
+        return "no reading"
+    raw, hinge, _, age, theta, rate, up = reading
+    if zero is None:
+        return f"encoder at {raw:.3f} rad, reading {age * 1000:.0f} ms old"
+    return (f"{np.degrees(np.arccos(up)):.0f} deg from up (theta {theta:+.2f} rad, {rate:+.2f} rad/s), "
+            f"hinge {hinge:+.2f} rad, reading {age * 1000:.0f} ms old")
 
 
 def wait_for_cloud(monitor, odom, lidar):
@@ -1069,7 +1212,7 @@ def restore_sport_mode(name, monitor, finished):
     return False
 
 
-def prepare_robot(args, monitor, digest, odom=None, lidar=None):
+def prepare_robot(args, monitor, digest, odom=None, lidar=None, pole=None):
     """Run the checks and confirmations for a real robot. Return the original mode."""
     if not sys.stdin.isatty():
         raise Refused("--robot needs an interactive terminal, for the confirmations")
@@ -1088,6 +1231,11 @@ def prepare_robot(args, monitor, digest, odom=None, lidar=None):
         mount = f"mount from {args.lidar_mount_file}" if args.lidar_mount else "no mount"
         inputs += (f"  Lidar:   {LIDAR_TOPICS[args.lidar_topic]}, {mount}, clouds of the last {args.lidar_window:g} s; "
                    f"now (sport mode on): {wait_for_cloud(monitor, odom, lidar)}\n")
+    if pole is not None:
+        mount = f"direction from {args.pole_mount_file}" if args.pole_mount_file else "the simulator's direction"
+        inputs += (f"  Pole:    {pole.describe()}, {mount}; now {describe_pole(pole, args.pole_mount, None, state)}\n"
+                   f"           The walk starts once the pole has hung still for {ZERO_WINDOW_S:g} s, which zeroes "
+                   f"the encoder. Keep 1 m clear of its swing.\n")
     if args.trajectory:
         source = f"  Trajectory: {args.trajectory} (sha256 {digest[:12]}), open loop\n"
         rate = args.rate
@@ -1192,6 +1340,16 @@ def parse_args():
     parser.add_argument("--max-cloud-age", type=bounded(0.05, 5.0), default=MAX_CLOUD_AGE,
                         help="with --env-source lidar, stop if the newest usable cloud is older than this many "
                              "seconds (default: %(default)s)")
+    parser.add_argument("--pole", metavar="SOURCE",
+                        help="give the policy the pendulum's pole state (robot_state[37:41]) from the rig's hinge "
+                             "encoder: its serial device (/dev/ttyACM0, or /dev/ttyACM0@BAUD; default baud 500000), or udp:PORT for "
+                             "go2/sim_headless.py --pendulum (udp:9870)")
+    parser.add_argument("--pole-mount", dest="pole_mount_file", type=Path, metavar="FILE",
+                        help="the encoder's direction, from go2/check_pole.py --calibrate (default: "
+                             "go2/logs/pole_mount.json; none for udp:, whose encoder turns with the hinge)")
+    parser.add_argument("--max-pole-age", type=bounded(0.01, 1.0), default=MAX_POLE_AGE, metavar="SECONDS",
+                        help="with --pole, stop if the encoder's newest reading is older than this "
+                             "(default: %(default)s)")
     parser.add_argument("--sport-mode", default=SPORT_MODE, metavar="NAME",
                         help="the sport mode to switch back to after the run, if the robot was already in "
                              "low-level mode when the run started (default: %(default)s); otherwise it "
@@ -1209,6 +1367,15 @@ def parse_args():
         parser.error("--fill-unmeasured only applies to policies")
     if args.trajectory and args.env_source == "lidar":
         parser.error("--env-source lidar only applies to policies")
+    if args.trajectory and args.pole:
+        parser.error("--pole only applies to policies")
+    args.pole_mount = None
+    if args.pole and not args.check:
+        try:
+            args.pole_mount, args.pole_mount_file = default_mount(args.pole, args.pole_mount_file)
+        except (OSError, ValueError, KeyError) as error:
+            parser.error(f"--pole needs the encoder's direction: {error}. Measure it with go2/check_pole.py "
+                         f"--calibrate")
     args.layout = EnvLayout(mode=args.env_mode, probe_ahead=args.probe_ahead, probe_lateral=args.probe_lateral,
                             probe_bearings_deg=args.probe_bearings, probe_range=args.probe_range,
                             probe_sector_deg=args.probe_sector, probe_rays_per_sector=args.probe_rays,
@@ -1228,7 +1395,7 @@ def main():
     log_path = args.log or Path(__file__).resolve().parent / "logs" / f"{datetime.now():%Y-%m-%d_%H-%M-%S}.npz"
     args.lidar_log = log_path.with_name(log_path.stem + "_lidar.npz")  # go2/lidar_worker.py's readings
     original_mode = None
-    lidar = None
+    lidar = pole = None
     commanding = False
     try:
         if args.trajectory:
@@ -1239,13 +1406,13 @@ def main():
                 print(f"Trajectory OK: {args.trajectory}\n  {describe_trajectory(rows, args.rate)}", flush=True)
                 return 0
         else:
-            policy, digest = prepare_policy(args.policy, env, args.fill_height)
+            policy, digest = prepare_policy(args.policy, env, args.fill_height, bool(args.pole))
             if args.seconds is None:
                 args.seconds = 3.0
             if args.check:
                 print(f"Policy OK: {args.policy}", flush=True)
                 return 0
-        monitor, subscriber, odom, lidar = connect(args)
+        monitor, subscriber, odom, lidar, pole = connect(args)
         if args.dry_run:
             if args.trajectory:
                 dry_run(monitor, args.seconds, args.rate,
@@ -1254,10 +1421,31 @@ def main():
                 start_yaw = read_state(monitor.msg).rpy[2]
                 if lidar is not None:
                     print(f"Lidar: {wait_for_cloud(monitor, odom, lidar)}", flush=True)
-                next_print = [0.0]
+                zero = None
+                if pole is not None:
+                    print(f"Let the pole hang still: its encoder is zeroed once it has for {ZERO_WINDOW_S:g} s.",
+                          flush=True)
+                    found = wait_still(pole, lambda: read_state(monitor.msg).quaternion, args.pole_mount.sign,
+                                       POLE_STILL_WAIT_S)
+                    if found is None:
+                        raise Refused(f"the pole didn't hang still for {ZERO_WINDOW_S:g} s within "
+                                      f"{POLE_STILL_WAIT_S:g} s")
+                    zero = found[0]
+                    print(f"Pole zeroed: it moved {np.degrees(found[1]):.1f} deg while hanging.", flush=True)
+                next_print = [0.0, 0.0]
 
                 def target_at(elapsed, state):
                     live = env
+                    pole_values = None
+                    if pole is not None:
+                        reading = read_pole(pole, args.pole_mount, zero, state)
+                        if reading is None or reading[3] > args.max_pole_age:
+                            raise Fault(f"no fresh reading from the pole's encoder ({pole.describe()})")
+                        theta, rate = reading[4], reading[5]
+                        pole_values = (theta, rate, math.cos(theta), math.sin(theta))
+                        if elapsed >= next_print[1]:
+                            next_print[1] += 1.0
+                            print(f"  pole {describe_pole(pole, args.pole_mount, zero, state)}", flush=True)
                     if lidar is not None:
                         now = time.perf_counter()
                         lidar.poll(now, state.rpy, odom.latest_pose(now))
@@ -1269,12 +1457,13 @@ def main():
                             next_print[0] += 1.0
                             print(f"  lidar env {np.array2string(live, precision=2, suppress_small=True)}  "
                                   f"({lidar.status(now)})", flush=True)
-                    return policy_target(policy, build_robot_state(state, start_yaw, args.fill_height), live)
+                    return policy_target(policy, build_robot_state(state, start_yaw, args.fill_height, pole_values),
+                                         live)
 
                 dry_run(monitor, args.seconds, args.policy_hz, target_at)
             return 0
         if args.robot:
-            original_mode = prepare_robot(args, monitor, digest, odom, lidar)
+            original_mode = prepare_robot(args, monitor, digest, odom, lidar, pole)
         commanding = True
     except (Refused, Fault) as error:
         print(f"REFUSED: {error}", flush=True)
@@ -1292,10 +1481,12 @@ def main():
     controller.odom = odom
     controller.lidar = lidar
     controller.probe_height = args.probe_height
+    if pole is not None:
+        pole.flush()  # what queued up during the confirmations is old
+        controller.pole, controller.pole_mount, controller.max_pole_age = pole, args.pole_mount, args.max_pole_age
     outcome = "finished"
     status = 0
     sport_mode = original_mode or args.sport_mode  # "" if an earlier run had already released it
-    handed_to = ""
     # A full collection of the growing log stalls the 500 Hz loop for ~25 ms; refcounting frees all but cycles.
     gc.disable()
     try:
@@ -1308,12 +1499,7 @@ def main():
         controller.run_sequence(motion, args.seconds, ask_before_walking=bool(args.robot))
         if controller.not_walked:
             outcome, status = f"not walked: {controller.not_walked}", 1
-        if args.robot and sport_mode and not args.leave_sport_off and status == 0:
-            handed_to = controller.hand_to_sport_mode(sport_mode)
-            if not handed_to:
-                print(f"Sport mode ({sport_mode}) didn't come back; lying the robot down limp.", flush=True)
-        if not handed_to:
-            controller.release()
+        controller.release()
     except Fault as fault:
         outcome, status = f"FAULT: {fault}", 1
     except KeyboardInterrupt:
@@ -1326,12 +1512,11 @@ def main():
         arm_watchdog(0.0)
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        if not handed_to:  # sport mode now drives the motors
-            try:
-                controller.damp()
-            except Exception:
-                traceback.print_exc()
-                outcome, status = f"{outcome}; DAMPING FAILED", 1
+        try:
+            controller.damp()
+        except Exception:
+            traceback.print_exc()
+            outcome, status = f"{outcome}; DAMPING FAILED", 1
         gc.enable()
 
     if lidar is not None:
@@ -1342,9 +1527,8 @@ def main():
         "policy_hz": args.policy_hz, "kp": args.kp, "kd": args.kd, "seconds": args.seconds,
         "torque_fraction": args.torque_fraction, "probe_height": args.probe_height,
         "fill_height": args.fill_height, "env_source": args.env_source, "env_layout": args.layout.as_dict(),
-        "env_hz": args.env_hz,
+        "env_hz": args.env_hz, "pole_source": args.pole, "max_pole_age": args.max_pole_age,
         "original_mode": original_mode,
-        "handed_to_sport_mode": handed_to,
         # "t" counts from this time.perf_counter() reading, so other programs' times,
         # such as go2/phone_camera.py's, can be matched to the log.
         "clock_start": controller.clock_start,
@@ -1353,9 +1537,7 @@ def main():
     controller.print_summary()
     if saved:
         print(f"Log: {saved}")
-    if handed_to:
-        print(f"Sport mode is on ({handed_to}).", flush=True)
-    elif args.robot:
+    if args.robot:
         if args.leave_sport_off:
             print("Sport mode is off (--leave-sport-off). Switch it on from the app, or restart the robot.")
         else:

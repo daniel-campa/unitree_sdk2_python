@@ -8,6 +8,7 @@ Unitree's, unmodified.
 
     python go2/sim_headless.py [--duration SECONDS] [--video OUT.mp4]
     python go2/sim_headless.py --viewer            # watch it in a window; closing the window stops it
+    python go2/sim_headless.py --pendulum top      # with S-M-ICRL's pendulum rig and its encoder, for --pole udp:9870
 """
 import argparse
 import math
@@ -44,6 +45,14 @@ parser.add_argument("--crate", type=float, metavar="DEG",
                     help="add push_box_turn's 0.45 m crate, fixed, --crate-distance from the robot at this bearing (+ = left)")
 parser.add_argument("--crate-distance", type=float, default=2.0, metavar="M",
                     help="how far the crate's centre is from the robot (default: %(default)s)")
+parser.add_argument("--pendulum", choices=("top", "sidearm"),
+                    help="carry S-M-ICRL's side-locked pendulum rig, the pole hanging and steadied until "
+                         "run_policy.py --pole lets it go, and stream its hinge angle as the rig's encoder does")
+parser.add_argument("--pole-port", type=int, default=9870,
+                    help="with --pendulum, the UDP port the encoder streams from (default: %(default)s)")
+parser.add_argument("--pole-counts", type=int, default=2400,
+                    help="with --pendulum, the encoder's counts per turn, 0 = exact (default: %(default)s, a 600 P/R "
+                         "quadrature encoder's)")
 args = parser.parse_args()
 if args.lidar and args.odom:
     parser.error("--lidar already publishes rt/utlidar/robot_odom, so leave out --odom")
@@ -68,8 +77,12 @@ from unitree_sdk2py_bridge import UnitreeSdk2Bridge  # noqa: E402
 
 BOX_NAME = "lidar_test_box"
 CRATE_NAME = "push_box_crate"
-if args.box or args.crate is not None:
+if args.box or args.crate is not None or args.pendulum:
     spec = mujoco.MjSpec.from_file(str(scene))
+    if args.pendulum:
+        from sim_pendulum import add_rig
+
+        add_rig(spec, args.pendulum)
     if args.box:
         spec.worldbody.add_geom(name=BOX_NAME, type=mujoco.mjtGeom.mjGEOM_BOX, pos=[0.45, 0.25, 0.05],
                                 size=[0.10, 0.20, 0.05], rgba=[0.8, 0.4, 0.2, 1.0])
@@ -110,12 +123,19 @@ elif args.odom:
     from sim_lidar import SimOdom
 
     lidar = SimOdom(model, data)
+encoder = None
+if args.pendulum:
+    from sim_pendulum import SimEncoder, pole_up_deg
+
+    encoder = SimEncoder(model, data, args.pole_port, args.pole_counts)
 
 VIDEO_FPS = 30
 # Rendering while stepping would slow the sim below real time, so poses are kept and rendered at exit.
 video_poses = [] if args.video else None
 
 VIEWER_FPS = 60
+# The pendulum's tip reaches about 1 m above the trunk, out of the robot-sized view.
+CAMERA_DISTANCE = 2.6 if args.pendulum else 1.4
 viewer = None
 if args.viewer:
     import mujoco.viewer
@@ -123,7 +143,7 @@ if args.viewer:
     viewer = mujoco.viewer.launch_passive(model, data, show_left_ui=False, show_right_ui=False)
     viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
     viewer.cam.trackbodyid = model.body("base_link").id
-    viewer.cam.distance, viewer.cam.azimuth, viewer.cam.elevation = 1.6, 135.0, -15.0
+    viewer.cam.distance, viewer.cam.azimuth, viewer.cam.elevation = CAMERA_DISTANCE + 0.2, 135.0, -15.0
     with viewer.lock():  # shadows and reflections cost most of the drawing time in software
         viewer.user_scn.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = 0
         viewer.user_scn.flags[mujoco.mjtRndFlag.mjRND_REFLECTION] = 0
@@ -139,7 +159,7 @@ def write_video():
     camera = mujoco.MjvCamera()
     camera.type = mujoco.mjtCamera.mjCAMERA_TRACKING
     camera.trackbodyid = model.body("base_link").id
-    camera.distance, camera.azimuth, camera.elevation = 1.4, 135.0, -15.0
+    camera.distance, camera.azimuth, camera.elevation = CAMERA_DISTANCE, 135.0, -15.0
     frame = mujoco.MjData(model)  # the bridge's threads still read `data`
     for qpos in video_poses:
         frame.qpos[:] = qpos
@@ -165,14 +185,16 @@ def report():
     while not stop.wait(1.0):
         w, x, y, z = data.qpos[3:7]
         tilt = 1.0 - 2.0 * (x * x + y * y)  # body-up z component; 1 = level
+        pole = f"  pole {pole_up_deg(model, data):5.1f} deg from up" if encoder is not None else ""
         print(
             f"t={data.time:7.2f}  base_x={data.qpos[0]:+.3f} m  base_y={data.qpos[1]:+.3f} m  "
-            f"base_z={data.qpos[2]:.3f} m  up_z={tilt:+.3f}",
+            f"base_z={data.qpos[2]:.3f} m  up_z={tilt:+.3f}{pole}",
             flush=True,
         )
 
 
-print(f"sim up: domain={args.domain} interface=lo dt={args.dt}", flush=True)
+rig = f" pendulum={args.pendulum} encoder=udp:{args.pole_port}" if args.pendulum else ""
+print(f"sim up: domain={args.domain} interface=lo dt={args.dt}{rig}", flush=True)
 threading.Thread(target=report, daemon=True).start()
 
 start = time.perf_counter()
@@ -182,6 +204,8 @@ try:
         mujoco.mj_step(model, data)
         if lidar is not None:
             lidar.step()
+        if encoder is not None:
+            encoder.step()
         if video_poses is not None and data.time * VIDEO_FPS >= len(video_poses):
             video_poses.append(data.qpos.copy())
         if viewer is not None and step_start - viewer_synced >= 1.0 / VIEWER_FPS:
